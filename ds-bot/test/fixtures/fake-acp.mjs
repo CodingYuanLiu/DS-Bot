@@ -23,11 +23,13 @@
 // and refuses any other, as it does.
 import { spawn } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
+import { request as httpRequest } from 'node:http'
 import { createInterface } from 'node:readline'
 
 const exitAfterTurn = process.argv.includes('--exit-after-turn')
 const cursorModes = process.argv.includes('--cursor-modes')
-const agyModes = process.argv.includes('--agy-modes')
+const agyModes = process.argv.includes('--agy-modes') || process.argv.includes('--agy')
+const replayOnLoad = process.argv.includes('--replay-on-load')
 const thoughtLevels = process.argv.includes('--thought-levels')
 const legacyModels = process.argv.includes('--legacy-models')
 const loadThoughtLevel = process.argv.includes('--load-thought-level')
@@ -121,6 +123,37 @@ async function mcpCall(server, name, args) {
   const text = await response.text()
   const line = text.split('\n').map(row => row.trim()).find(row => row.startsWith('data: ') && row.includes('"result"'))
   return JSON.parse(line.slice(6)).result
+}
+
+function callSteerHook(payload) {
+  const sock = process.env.DSBOT_STEER_SOCK
+  const url = process.env.DSBOT_STEER_URL
+  const token = process.env.DSBOT_STEER_TOKEN
+  if ((!sock && !url) || !token) return Promise.resolve({})
+  const body = JSON.stringify(payload)
+  const target = sock
+    ? { socketPath: sock, path: '/steer' }
+    : (() => { const parsed = new URL(url); return { hostname: parsed.hostname, port: parsed.port, path: parsed.pathname } })()
+  return new Promise((resolve) => {
+    const req = httpRequest({
+      ...target,
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+        authorization: `Bearer ${token}`,
+      },
+    }, (res) => {
+      let raw = ''
+      res.setEncoding('utf8')
+      res.on('data', chunk => { raw += chunk })
+      res.on('end', () => {
+        try { resolve(res.statusCode === 200 ? JSON.parse(raw) : {}) } catch { resolve({}) }
+      })
+    })
+    req.on('error', () => resolve({}))
+    req.end(body)
+  })
 }
 
 async function runPrompt(session, prompt, requestId) {
@@ -278,6 +311,57 @@ async function runPrompt(session, prompt, requestId) {
     }
     return
   }
+  if (text.includes('hook-steer')) {
+    const viaStop = text.includes('hook-steer-stop')
+    update(sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'step1 thinking' } })
+    update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'step1 working' } })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    if (viaStop) {
+      const stopRes = await callSteerHook({ conversationId: sessionId, hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL' })
+      if (stopRes.decision === 'continue') {
+        const preRes = await callSteerHook({ conversationId: sessionId, hookEventName: 'PreInvocation', invocationNum: 1 })
+        const injected = (preRes.injectSteps ?? []).map(step => step.userMessage).join(' | ')
+        finish(`stop-steered: ${injected}`)
+        return
+      }
+      finish('no-stop-steer')
+      return
+    }
+    const postRes = await callSteerHook({ conversationId: sessionId, hookEventName: 'PostInvocation', invocationNum: 0 })
+    if (postRes.terminationBehavior === 'force_continue' && (postRes.injectSteps?.length ?? 0) > 0) {
+      const injected = postRes.injectSteps.map(step => step.userMessage).join(' | ')
+      finish(`steered: ${injected}`)
+      return
+    }
+    finish('no-steer')
+    return
+  }
+  if (text.includes('group-progress')) {
+    update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Opening note before tools.' } })
+    update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'gp-1', kind: 'read', status: 'in_progress', locations: [{ path: 'a.js' }] })
+    update(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'gp-1', status: 'completed' })
+    update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Milestone halfway done.' } })
+    update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'gp-2', kind: 'execute', status: 'in_progress', rawInput: { command: 'npm test' } })
+    update(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'gp-2', status: 'completed' })
+    finish('Final result delivered.')
+    return
+  }
+  if (text.includes('bg-wakeup')) {
+    const withMcp = text.includes('bg-wakeup-mcp')
+    finish('started in background')
+    setTimeout(async () => {
+      update(sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'checking background output' } })
+      update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'bg-t1', kind: 'execute', status: 'in_progress', rawInput: { command: 'cat out.log' } })
+      update(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'bg-t1', status: 'completed' })
+      let suffix = 'ok'
+      if (withMcp && session.mcp) {
+        const result = await mcpCall(session.mcp, 'message_bot', { to: 'Chief', message: 'bg done' })
+        suffix = (result.content ?? []).map(block => block.text).join('')
+      }
+      update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `background finished: ${suffix}` } })
+    }, 25)
+    return
+  }
   update(sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: `thought about: ${text.slice(0, 40)}` } })
   update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 't0', kind: 'read', status: 'in_progress', locations: [{ path: 'src/a.js' }] })
   update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 't1', kind: 'execute', status: 'in_progress', rawInput: { command: 'npm test' } })
@@ -376,12 +460,24 @@ process.stdin.on('data', (chunk) => {
             : { url: server.url, token: (server.headers ?? []).find(header => header.name === 'Authorization')?.value?.replace('Bearer ', '') }
         }
         saveSaved()
+        if (replayOnLoad) {
+          update(params.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STALE_BEFORE_LOAD_REPLY ' } })
+          update(params.sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'STALE_THOUGHT ' } })
+        }
         reply(id, {
           sessionId: params.sessionId,
           ...(loadThoughtLevel ? {
             configOptions: [{ id: 'thought_level', category: 'thought_level', name: 'Thinking Level', currentValue: session.thoughtLevel, options: [{ value: 'low', name: 'Low' }, { value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }] }],
           } : {}),
         })
+        if (replayOnLoad) {
+          setTimeout(() => {
+            update(params.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STALE_AFTER_LOAD_REPLY_1 ' } })
+            setTimeout(() => {
+              update(params.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STALE_AFTER_LOAD_REPLY_2 ' } })
+            }, 20)
+          }, 10)
+        }
         break
       }
       case 'session/set_config_option':

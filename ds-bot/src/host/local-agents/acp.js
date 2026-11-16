@@ -2,13 +2,18 @@
 // folder when the CLI pins shell commands to its process cwd), ACP over stdio.
 // A process multiplexes sessions: each DS Bot Session maps to one ACP session,
 // created or resumed with our loopback MCP server attached.
+import { execFile } from 'node:child_process'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { JsonRpcPeer, wireProcess, EventQueue } from './jsonrpc.js'
 import { cleanEnv, findEngineExecutable, spawnAgent } from './discover.js'
 import { acpMode } from './engines.js'
+import { AgySteerServer, ensureAgySteerPlugin } from './agy-steer.js'
+
+const execFileAsync = promisify(execFile)
 
 const CLIENT = { name: 'ds-bot', version: '1' }
 // DS Bot's loopback MCP server, which carries the Bot's team tools.
@@ -48,12 +53,19 @@ const EFFORT_NAMES = { off: 'Off', minimal: 'Minimal', low: 'Low', medium: 'Medi
 // {type:'context',used?,size?} (how full the CLI's own context is) |
 // {type:'compaction',status:'started'|'completed'|'failed'}
 export class AcpEngine {
-  constructor(route, engine, { findExecutable, defaultEfforts = new Map(), sessionEfforts = new Map() }) {
+  constructor(route, engine, { findExecutable, defaultEfforts = new Map(), sessionEfforts = new Map(), drainSteer, hasPendingSteer, onStopState, agyHomeDir, replayQuietMs, steerServer } = {}) {
     this.route = route
     this.engine = engine
     this.findExecutable = findExecutable
     this.defaultEfforts = defaultEfforts
     this.sessionEfforts = sessionEfforts
+    this.drainSteer = drainSteer
+    this.hasPendingSteer = hasPendingSteer
+    this.onStopState = onStopState
+    this.agyHomeDir = agyHomeDir
+    this.replayQuietMs = replayQuietMs
+    this.steerServer = steerServer
+    this.ownsSteerServer = steerServer === undefined
     this.hasModelConfig = false
     this.child = undefined
     this.peer = undefined
@@ -71,6 +83,24 @@ export class AcpEngine {
     this.ephemeral = false
   }
 
+  ensureSteerServer() {
+    if (this.steerServer === undefined) {
+      this.steerServer = new AgySteerServer({
+        drain: this.drainSteer,
+        hasPending: this.hasPendingSteer,
+        onStopState: this.onStopState,
+      })
+      this.ownsSteerServer = true
+    }
+    return this.steerServer
+  }
+
+  setSteerPending(cliSessionId, pending) {
+    if (this.engine.hookSteer === true && cliSessionId !== undefined) {
+      this.steerServer?.setPending(cliSessionId, pending)
+    }
+  }
+
   activeWorker() {
     return [...this.workers.values()].find(worker => worker.peer !== undefined)
   }
@@ -79,7 +109,17 @@ export class AcpEngine {
     return new AcpEngine(
       this.route,
       { ...this.engine, cwdPerProcess: false, ...(cwd ? { spawnCwd: cwd } : {}) },
-      { findExecutable: this.findExecutable, defaultEfforts: new Map(this.defaultEfforts), sessionEfforts: this.sessionEfforts },
+      {
+        findExecutable: this.findExecutable,
+        defaultEfforts: new Map(this.defaultEfforts),
+        sessionEfforts: this.sessionEfforts,
+        drainSteer: this.drainSteer,
+        hasPendingSteer: this.hasPendingSteer,
+        onStopState: this.onStopState,
+        agyHomeDir: this.agyHomeDir,
+        replayQuietMs: this.replayQuietMs,
+        steerServer: this.engine.hookSteer === true ? this.ensureSteerServer() : undefined,
+      },
     )
   }
 
@@ -102,10 +142,18 @@ export class AcpEngine {
   async startPeer() {
     const bin = findEngineExecutable(this.engine, name => this.findExecutable(name))
     if (bin === undefined) throw Object.assign(new Error(`${this.engine.name} is not installed`), { code: 'NO_ADAPTER' })
+    let steerEnv = {}
+    if (this.engine.hookSteer === true) {
+      if (this.agyHomeDir !== false) {
+        ensureAgySteerPlugin(typeof this.agyHomeDir === 'string' ? { homeDir: this.agyHomeDir } : {})
+      }
+      const server = this.ensureSteerServer()
+      steerEnv = await server.listen()
+    }
     const spawnCwd = this.engine.spawnCwd && existsSync(this.engine.spawnCwd) ? this.engine.spawnCwd : undefined
     const child = spawnAgent(bin, this.engine.args ?? [], {
       ...(spawnCwd !== undefined ? { cwd: spawnCwd } : {}),
-      env: cleanEnv(this.engine.env ?? {}),
+      env: cleanEnv({ ...(this.engine.env ?? {}), ...steerEnv }),
       stdio: ['pipe', 'pipe', 'inherit'],
       windowsHide: true,
     })
@@ -171,7 +219,7 @@ export class AcpEngine {
     // still waiting there: a reopened session needs a fresh one.
     if (session === undefined || session.dead) {
       const queue = new EventQueue()
-      session = { dshSessionId, acpSessionId: undefined, dead: false, modes: [], toolCalls: new Map(), push: event => queue.push(event), next: () => queue.next() }
+      session = { dshSessionId, acpSessionId: undefined, dead: false, replaying: false, lastReplayAt: 0, replayDone: undefined, modes: [], toolCalls: new Map(), push: event => queue.push(event), next: () => queue.next() }
       this.sessions.set(dshSessionId, session)
     }
     return session
@@ -186,6 +234,17 @@ export class AcpEngine {
     }
     const session = [...this.sessions.values()].find(entry => entry.acpSessionId === params?.sessionId)
     if (session === undefined) return
+    if (session.replaying === true) {
+      if (method === 'session/update') {
+        session.lastReplayAt = Date.now()
+        const update = params?.update ?? {}
+        if (update.sessionUpdate === 'config_option_update' && Array.isArray(update.configOptions)) {
+          session.configOptions = update.configOptions
+          session.modes = update.modes?.availableModes ?? configOptionsOf(update.configOptions, 'mode')?.options ?? session.modes
+        }
+      }
+      return
+    }
     // Devin CLI 3000.12 reports its compaction this way, not as compaction_update.
     if (method === '_cognition.ai/compaction') {
       session.push({ type: 'compaction', status: compactionStatus(params?.status) })
@@ -206,6 +265,7 @@ export class AcpEngine {
         if (id !== undefined) session.toolCalls.set(id, call)
         if (known === undefined) session.push({ type: 'activity', text: `▸ ${describeCall(call)}` })
         else if (update.status === 'failed' && known.status !== 'failed') session.push({ type: 'activity', text: `▸ ${describeCall(call)} — failed` })
+        else session.push({ type: 'touch' })
         break
       }
       case 'plan': session.push({ type: 'thought', text: planText(update.entries) }); break
@@ -325,7 +385,10 @@ export class AcpEngine {
   }
 
   // Resumes an ACP session across the same MCP transport fallback ladder as newSession.
-  async loadSession(peer, { cwd, mcp, resumeId }) {
+  async loadSession(peer, { cwd, mcp, resumeId, session }) {
+    session.acpSessionId = resumeId
+    session.replaying = true
+    session.lastReplayAt = 0
     const modes = this.mcpModes(mcp)
     for (let i = 0; i < modes.length; i++) {
       const mode = modes[i]
@@ -335,8 +398,18 @@ export class AcpEngine {
         return { reply, loaded: true }
       } catch (error) {
         const text = String(error?.message ?? error)
-        if (AUTH_ERROR.test(text) || TIMEOUT_ERROR.test(text)) throw error
-        if (i === modes.length - 1) return { reply: await this.newSession(peer, { cwd, mcp }), loaded: false }
+        if (AUTH_ERROR.test(text) || TIMEOUT_ERROR.test(text)) {
+          session.acpSessionId = undefined
+          session.replaying = false
+          session.lastReplayAt = 0
+          throw error
+        }
+        if (i === modes.length - 1) {
+          session.acpSessionId = undefined
+          session.replaying = false
+          session.lastReplayAt = 0
+          return { reply: await this.newSession(peer, { cwd, mcp }), loaded: false }
+        }
       }
     }
   }
@@ -348,9 +421,10 @@ export class AcpEngine {
     const peer = await this.ensure()
     const session = this.sessionFor(dshSessionId)
     const { reply, loaded } = resumeId !== undefined
-      ? await this.loadSession(peer, { cwd, mcp, resumeId })
+      ? await this.loadSession(peer, { cwd, mcp, resumeId, session })
       : { reply: await this.newSession(peer, { cwd, mcp }), loaded: false }
     session.acpSessionId = reply?.sessionId ?? resumeId
+    if (!loaded) session.replaying = false
     const loadedEffort = configOptionsOf(reply?.configOptions ?? [], 'thought_level')?.currentValue
     // Some agents list nothing on session/load: the session reads what this CLI
     // listed before rather than guessing a mode or model list.
@@ -367,6 +441,7 @@ export class AcpEngine {
     let modelReply
     if (modelKey !== '') {
       modelReply = await this.setOption(session, 'model', modelKey).catch((error) => {
+        session.replaying = false
         throw Object.assign(new Error(`${this.engine.name} did not switch to the model ${modelKey}: ${error?.message ?? error}. Pick another model in the Bot's settings.`), { code: 'LOCAL_AGENT_MODEL' })
       })
     }
@@ -385,6 +460,10 @@ export class AcpEngine {
       const currentEffort = switchedEffort ?? priorEffort
       session.effort = currentEffort !== undefined && currentEffort !== session.defaultEffort ? currentEffort : undefined
       this.setSessionEffort(session.acpSessionId, session.effort)
+      session.replayDone = settleReplay(session, this.replayQuietMs).then(() => {
+        session.replaying = false
+        session.replayDone = undefined
+      })
     }
     return session
   }
@@ -425,6 +504,7 @@ export class AcpEngine {
     const worker = this.workerOf(session)
     if (worker !== undefined && worker !== this) return worker.prompt(session, blocks, { signal, effort })
     const peer = await this.ensure()
+    if (session.replayDone !== undefined) await session.replayDone
     if (configOptionsOf(session.configOptions ?? [], 'thought_level') !== undefined || session.defaultEffort !== undefined || session.effort !== undefined) {
       const current = session.effort ?? session.defaultEffort
       const target = effort ?? session.defaultEffort
@@ -509,10 +589,31 @@ export class AcpEngine {
     this.sessions.delete(dshSessionId)
   }
 
+  async hasActiveChildren() {
+    if (this.engine.cwdPerProcess) {
+      for (const worker of this.workers.values()) {
+        if (await worker.hasActiveChildren()) return true
+      }
+      return false
+    }
+    const pid = this.child?.pid
+    if (typeof pid !== 'number') return false
+    try {
+      const { stdout } = await execFileAsync('pgrep', ['-P', String(pid)], { timeout: 2_000 })
+      return stdout.trim() !== ''
+    } catch {
+      return false
+    }
+  }
+
   async close() {
     for (const worker of this.workers.values()) await worker.close()
     this.workers.clear()
     this.sessionWorkers.clear()
+    if (this.ownsSteerServer) {
+      this.steerServer?.close()
+      this.steerServer = undefined
+    }
     const child = this.child
     this.child = undefined
     this.peer = undefined
@@ -697,3 +798,22 @@ export const usageOf = (usage) => {
   }
 }
 const compactionStatus = status => (status === 'completed' ? 'completed' : status === 'started' || status === 'in_progress' ? 'started' : 'failed')
+
+const REPLAY_QUIET_MS = 80
+const REPLAY_MAX_MS = 2_000
+
+// ACP `session/load` streams historical `session/update` notifications from an
+// async worker that can outlive the `session/load` RPC response itself. Drain
+// until stdout has stayed silent for `quietMs` before sending a new prompt.
+async function settleReplay(session, quietMs = REPLAY_QUIET_MS) {
+  if (session.lastReplayAt === 0) {
+    await new Promise(resolve => setTimeout(resolve, Math.min(15, quietMs)))
+    if (session.lastReplayAt === 0) return
+  }
+  const deadline = Date.now() + REPLAY_MAX_MS
+  while (session.replaying && !session.dead && Date.now() < deadline) {
+    const elapsed = Date.now() - session.lastReplayAt
+    if (elapsed >= quietMs) return
+    await new Promise(resolve => setTimeout(resolve, Math.min(20, quietMs - elapsed)))
+  }
+}

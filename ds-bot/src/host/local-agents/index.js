@@ -5,20 +5,26 @@
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { SOURCE_KIND } from '../constants.js'
 import { serviceOf } from '../services.js'
-import { splitRef } from '../text.js'
+import { splitRef, textOf } from '../text.js'
 import { output } from '../tools.js'
 import { LocalAgentAdapter } from './adapter.js'
 import { AcpEngine } from './acp.js'
 import { CodexEngine } from './codex.js'
 import { ClaudeEngine } from './claude.js'
-import { ENGINES, customRoute, isLocalAgentRoute, validateCustom } from './engines.js'
+import { ENGINES, canSteerEngine, customRoute, engineOf as specOfEngine, isLocalAgentRoute, validateCustom } from './engines.js'
 import { cleanEnv, findEngineExecutable, findExecutable, probeSignIn, probeVersion, refreshSearchDirs } from './discover.js'
 
 const SIGNED_IN_TTL_MS = 60_000
 
-const spawnEngine = (kind, route, spec) => (kind === 'acp' ? new AcpEngine(route, spec, { findExecutable })
+const isSteerableMessage = message => message?.role === 'user'
+  && message.source?.kind !== 'runtime-context'
+  && !(message.source?.kind === SOURCE_KIND && message.source?.role === 'background')
+
+const spawnEngine = (kind, route, spec, hooks = {}) => (kind === 'acp' ? new AcpEngine(route, spec, { findExecutable, ...hooks })
   : kind === 'codex' ? new CodexEngine(route, spec, { findExecutable })
     : new ClaudeEngine(route, spec, { findExecutable }))
 
@@ -74,6 +80,8 @@ export function install(rt) {
     return { available: supported(), detected: detected(), custom: customView() }
   }
 
+  const liveAgent = sessionId => ctx.get?.('agents')?.get(sessionId) ?? ctx.agents?.get?.(sessionId)
+
   const adapter = new LocalAgentAdapter({
     rt,
     customAgents,
@@ -111,6 +119,42 @@ export function install(rt) {
       const names = new Set([...rt.teamTools.map(def => def.name), 'approve_agent_action'])
       return (options.tools ?? []).filter(tool => names.has(tool.name))
     },
+    peekInboxSteers: (sessionId, excludeIds) => (liveAgent(sessionId)?.inbox?.nextStep ?? [])
+      .filter(msg => isSteerableMessage(msg) && !(excludeIds?.has(msg.id)))
+      .map(msg => ({ id: msg.id, text: textOf(msg.content) })),
+    hasInboxSteers: sessionId => (liveAgent(sessionId)?.inbox?.nextStep ?? []).some(isSteerableMessage),
+    onStreamTouch: (sessionId) => {
+      if (rt.groupOwners.has(sessionId)) rt.touchRoomTurn?.(sessionId)
+    },
+    onCliWork: (sessionId, stepTexts) => {
+      rt.noteCliWork?.(sessionId, stepTexts)
+    },
+    onBackgroundWake: async (sessionId) => {
+      const agent = await rt.resolveAgent(sessionId).catch(() => undefined)
+      if (typeof agent?.followup !== 'function') return false
+      const already = (agent.inbox?.nextTurn ?? []).some(msg => msg?.source?.kind === SOURCE_KIND && msg.source.role === 'background')
+      if (!already) {
+        agent.followup(createUserMessage({
+          content: [{ type: 'text', text: '[Background update]' }],
+          source: { kind: SOURCE_KIND, form: 'relay', role: 'background' },
+        }))
+      }
+      await ctx.sessions.flush(agent.session)
+      return true
+    },
+    onBackgroundSettled: async (sessionId) => {
+      const agent = await rt.resolveAgent(sessionId).catch(() => undefined)
+      if (typeof agent?.inbox?.remove !== 'function') return
+      let removed = false
+      const queued = Array.from(agent.inbox.nextTurn ?? [])
+      for (const msg of queued) {
+        if (msg?.source?.kind === SOURCE_KIND && msg.source.role === 'background') {
+          agent.inbox.remove(msg.id)
+          removed = true
+        }
+      }
+      if (removed) await ctx.sessions.flush(agent.session)
+    },
   })
 
   let registration
@@ -136,6 +180,13 @@ export function install(rt) {
   const initialScan = scan()
   // Custom agents arrive with the state load; their routes register then too.
   void rt.load?.().then(() => { if (!disposed) applyRoutes() }).catch(() => {})
+  ctx.on?.('session/event', (session, event) => {
+    const id = session?.id
+    if (id === undefined || event?.type !== 'agent/inbox/spliced' || event.data?.target !== 'next-step') return
+    if (!(event.data.inserted ?? []).some(isSteerableMessage)) return
+    adapter.markSteerPending(id)
+    queueMicrotask(() => adapter.notifySteer(id))
+  })
   // The callback returns the disposer: running adapter.dispose() inside the
   // setup would leave the adapter disposed from the moment it installs.
   ctx.effect(() => async () => {
@@ -163,6 +214,12 @@ export function install(rt) {
   const isLocalAgentSession = (sessionId) => {
     const bot = rt.botOf(rt.selfOf(sessionId))
     return bot !== undefined && localAgentOf(bot) !== undefined
+  }
+  const canSteerLocalAgentSession = (sessionId) => {
+    const bot = rt.botOf(rt.selfOf(sessionId))
+    const ref = bot !== undefined ? localAgentOf(bot) : undefined
+    const provider = ref !== undefined ? splitRef(ref)?.provider : undefined
+    return provider !== undefined && canSteerEngine(specOfEngine(provider, customAgents()))
   }
 
   // ---------------------------------------------------------------------------
@@ -260,7 +317,7 @@ export function install(rt) {
   }
 
   Object.assign(rt, {
-    isLocalAgentRoute, isLocalAgentRef, engineOf, engineOfBot, localAgentOf, isLocalAgentSession,
+    isLocalAgentRoute, isLocalAgentRef, engineOf, engineOfBot, localAgentOf, isLocalAgentSession, canSteerLocalAgentSession,
     localAgentRoutes: allRoutes, localAgentsEndpoint, localAgentModels,
     engineNameOf: ref => (isLocalAgentRef(ref) ? adapter.providerInfo(splitRef(ref).provider).name : `the model ${ref}`),
     closeLocalAgentSession: (sessionId, reason) => adapter.closeSession(sessionId, reason),

@@ -14,7 +14,11 @@ export const DEFAULT_CONTEXT_WINDOW = 200_000
 const REPLAY_MESSAGES = 12
 const REPLAY_BYTES = 24 * 1024
 const IDLE_CLOSE_MS = 10 * 60_000
+const BG_IDLE_SETTLE_MS = 3_000
+const BG_ACTIVE_SETTLE_MS = 15_000
 const APPROVE_TOOL = 'approve_agent_action'
+
+const isBackgroundWake = message => message?.role === 'user' && message.source?.kind === 'bot' && message.source?.role === 'background'
 // A CLI that answers its compaction command first and condenses after (Devin) says
 // that it started within this long, or it is taken to have condensed without a word.
 const COMPACT_START_MS = 15_000
@@ -83,10 +87,88 @@ export class LocalAgentAdapter extends LlmAdapter {
     if (driver === undefined) {
       const spec = engineOf(route, this.deps.customAgents())
       if (spec === undefined) throw new LlmError(`Unknown local agent ${route}`, 'NO_ADAPTER')
-      driver = this.deps.spawnEngine(spec.kind, route, spec)
+      driver = this.deps.spawnEngine(spec.kind, route, spec, {
+        drainSteer: cliSessionId => this.drainHookSteer(route, cliSessionId),
+        hasPendingSteer: cliSessionId => this.hasHookSteer(route, cliSessionId),
+        onStopState: (cliSessionId, fullyIdle) => this.noteHookStopState(route, cliSessionId, fullyIdle),
+      })
       this.engines.set(route, driver)
     }
     return driver
+  }
+
+  liveByCliSession(route, cliSessionId) {
+    if (typeof cliSessionId !== 'string' || cliSessionId === '') return undefined
+    return [...this.live.values()].find(entry => !entry.dead && entry.route === route
+      && (entry.engineSession?.acpSessionId === cliSessionId || entry.cliSessionId === cliSessionId))
+  }
+
+  drainHookSteer(route, cliSessionId) {
+    const live = this.liveByCliSession(route, cliSessionId)
+    if (live === undefined) return []
+    const items = live.steerQueue.splice(0)
+    if (live.state === 'running') {
+      const inboxItems = this.deps.peekInboxSteers?.(live.sessionId, live.steeredIds) ?? []
+      if (inboxItems.length > 0) {
+        for (const item of inboxItems) {
+          live.steeredIds.add(item.id)
+          if (item.text !== '') items.push(item.text)
+        }
+        live.push({ type: 'steered' })
+      }
+    }
+    live.engine.setSteerPending?.(cliSessionId, this.hasHookSteer(route, cliSessionId))
+    return items
+  }
+
+  hasHookSteer(route, cliSessionId) {
+    const live = this.liveByCliSession(route, cliSessionId)
+    if (live === undefined) return false
+    if (live.steerQueue.length > 0) return true
+    if (live.state === 'running') {
+      return (this.deps.peekInboxSteers?.(live.sessionId, live.steeredIds)?.length ?? 0) > 0
+    }
+    return false
+  }
+
+  noteHookStopState(route, cliSessionId, fullyIdle) {
+    const live = this.liveByCliSession(route, cliSessionId)
+    if (live !== undefined) live.cliFullyIdle = fullyIdle !== false
+  }
+
+  markSteerPending(sessionId) {
+    const live = this.live.get(String(sessionId))
+    if (live === undefined || live.dead || live.spec.hookSteer !== true) return
+    const cliSessionId = live.engineSession?.acpSessionId ?? live.cliSessionId
+    if (cliSessionId !== undefined) {
+      live.engine.setSteerPending?.(cliSessionId, this.hasHookSteer(live.route, cliSessionId))
+    }
+  }
+
+  notifySteer(sessionId) {
+    const live = this.live.get(String(sessionId))
+    if (live === undefined || live.dead || live.state !== 'running') return
+    if (live.spec.hookSteer === true) {
+      this.markSteerPending(sessionId)
+      return
+    }
+    if (live.spec.kind !== 'codex' && live.spec.kind !== 'claude') return
+    const inboxItems = this.deps.peekInboxSteers?.(live.sessionId, live.steeredIds) ?? []
+    if (inboxItems.length === 0) return
+    const texts = []
+    for (const item of inboxItems) {
+      live.steeredIds.add(item.id)
+      if (item.text !== '') texts.push(item.text)
+    }
+    if (texts.length > 0) {
+      try {
+        Promise.resolve(live.engine.steer?.(live.engineSession, texts.join('\n\n')))
+          .catch(error => live.push({ type: 'error', error }))
+      } catch (error) {
+        live.push({ type: 'error', error })
+      }
+    }
+    live.push({ type: 'steered' })
   }
 
   // What DS Bot knows of a route without starting its CLI: the CLI's default, what a
@@ -163,7 +245,7 @@ export class LocalAgentAdapter extends LlmAdapter {
       }
       // A CLI takes its model and permission mode when its session opens. Another
       // model or preset reopens the same CLI session as soon as no turn runs in it.
-      if ((live.model === options.model && live.preset === preset) || live.state !== 'idle') return live
+      if ((live.model === options.model && live.preset === preset) || live.state !== 'idle' || live.background) return live
       await this.closeLive(live, { idle: true })
     } else if (live !== undefined) await this.closeLive(live)
     const spec = engineOf(route, this.deps.customAgents())
@@ -186,9 +268,13 @@ export class LocalAgentAdapter extends LlmAdapter {
       // 'idle': no CLI turn. 'running': a prompt is in flight. 'suspended': the
       // turn waits on a bridged tool call or a permission answer.
       state: 'idle',
+      background: false,
+      cliFullyIdle: true,
       // Prompts queued while a turn runs (ACP speaks one prompt at a time);
       // the drain sends the next one when the turn ends.
       queue: [],
+      steerQueue: [],
+      steeredIds: new Set(),
       idle: undefined,
       cwd: record?.cwd,
       model: options.model,
@@ -207,11 +293,35 @@ export class LocalAgentAdapter extends LlmAdapter {
       clearTimeout(live.idle)
       live.idle = setTimeout(() => void this.closeLive(live, { idle: true }), IDLE_CLOSE_MS)
       live.idle.unref?.()
+      if (event?.type === 'touch' && live.state === 'idle' && !live.background) return
+      if (live.state === 'idle' && !live.background
+        && (event?.type === 'text' || event?.type === 'thought' || event?.type === 'activity' || event?.type === 'call' || event?.type === 'permission')) {
+        live.background = true
+        this.wakeBackground(live)
+      }
       const waiter = live.waiters.shift()
       if (waiter !== undefined) waiter(event)
       else live.events.push(event)
     }
-    live.next = () => (live.events.length > 0 ? Promise.resolve(live.events.shift()) : new Promise(resolve => live.waiters.push(resolve)))
+    live.next = (timeoutMs) => {
+      if (live.events.length > 0) return Promise.resolve(live.events.shift())
+      return new Promise((resolve) => {
+        let timer
+        const waiter = (event) => {
+          if (timer !== undefined) clearTimeout(timer)
+          resolve(event)
+        }
+        if (timeoutMs !== undefined) {
+          timer = setTimeout(() => {
+            const at = live.waiters.indexOf(waiter)
+            if (at !== -1) live.waiters.splice(at, 1)
+            resolve({ type: 'bg-settle' })
+          }, timeoutMs)
+          timer.unref?.()
+        }
+        live.waiters.push(waiter)
+      })
+    }
     this.live.set(sessionId, live)
     return live
   }
@@ -294,6 +404,18 @@ export class LocalAgentAdapter extends LlmAdapter {
 
   async closeLive(live, { idle = false } = {}) {
     if (live.dead) return
+    if (idle) {
+      if (live.state !== 'idle' || live.background || live.cliFullyIdle === false || await live.engine.hasActiveChildren?.()) {
+        clearTimeout(live.idle)
+        live.idle = setTimeout(() => void this.closeLive(live, { idle: true }), IDLE_CLOSE_MS)
+        live.idle.unref?.()
+        return
+      }
+    }
+    live.bgAbort?.abort()
+    live.background = false
+    const cliSessionId = live.engineSession?.acpSessionId ?? live.cliSessionId
+    if (cliSessionId !== undefined) live.engine.setSteerPending?.(cliSessionId, false)
     live.dead = true
     clearTimeout(live.idle)
     this.live.delete(live.sessionId)
@@ -312,12 +434,22 @@ export class LocalAgentAdapter extends LlmAdapter {
 
   // The turn under way ends: the CLI stops, and a call it waits on gets an answer.
   stopTurn(live, reason) {
+    live.bgAbort?.abort()
+    live.bgAbort = undefined
+    live.background = false
+    live.cliFullyIdle = true
     live.state = 'idle'
     live.queue.length = 0
+    live.steerQueue.length = 0
+    live.steeredIds.clear()
+    live.events.length = 0
+    const cliSessionId = live.engineSession?.acpSessionId ?? live.cliSessionId
+    if (cliSessionId !== undefined) live.engine.setSteerPending?.(cliSessionId, false)
     const stopped = live.engineSession === undefined ? undefined : live.engine.cancel?.(live.engineSession)
     live.mcp?.failAll(new Error(reason))
     for (const pending of live.pending.values()) pending.resolve({ text: reason, isError: true })
     live.pending.clear()
+    for (const waiter of live.waiters.splice(0)) waiter({ type: 'done', reason: 'stop' })
     return stopped
   }
 
@@ -407,17 +539,20 @@ export class LocalAgentAdapter extends LlmAdapter {
       pending.resolve({ text, isError: message.isError === true })
       settled.push({ name: pending.name, text, isError: message.isError === true })
     }
+    const resolvedTool = settled.length > 0
+    const hasBackgroundWake = delta.some(isBackgroundWake)
     // The loop's runtime-context user messages are context, not input: they
     // fold into the next prompt or steer, never start a prompt on their own.
     const contextText = delta
       .filter(message => message.role === 'user' && message.source?.kind === 'runtime-context')
       .map(message => textOf(message.content)).filter(text => text !== '').join('\n')
-    const users = delta.filter(message => message.role === 'user' && message.source?.kind !== 'runtime-context')
+    const users = delta.filter(message => message.role === 'user' && message.source?.kind !== 'runtime-context' && !isBackgroundWake(message) && !live.steeredIds.delete(message.id))
     // The first open bridged call that is not an approval may take the user's
     // next message as its answer; the rest of the input is new.
     const openCall = [...live.pending.entries()].find(([, entry]) => entry.name !== APPROVE_TOOL)
     const remaining = []
     let answered = openCall === undefined
+    let answeredOpenCall = false
     for (const message of users) {
       if (!answered && openCall !== undefined) {
         const [id, pending] = openCall
@@ -428,6 +563,7 @@ export class LocalAgentAdapter extends LlmAdapter {
         // settled result the turn below has to carry, like a tool result (#1513).
         settled.push({ name: openCall[1].name, text: answer, isError: false })
         answered = true
+        answeredOpenCall = true
       } else {
         remaining.push(message)
       }
@@ -497,55 +633,76 @@ export class LocalAgentAdapter extends LlmAdapter {
 
     const supportsImages = live.spec.kind !== 'acp' || live.engine.supportsImages?.(live.engineSession) !== false
     const resolveImage = block => this.resolveImageBlock(block, { supportsImages, signal: options.signal })
-    let promptBlocks = fresh
-      ? await renderReplay(messages, system, resolveImage)
-      : await renderDelta(contextText, remaining, resolveImage)
-    let sentInstructions = live.spec.kind !== 'acp' && freshCli && instructions !== undefined
-    // A new CLI session gets its instructions in the open args or the replay;
-    // the "updated" line is only for a session that saw older ones.
-    if (instructions !== undefined && !freshCli && live.promptHash !== promptHash) {
-      const updated = `Updated team instructions (replace earlier ones):\n\n${instructions}`
-      if (live.spec.kind === 'codex') {
-        await live.engine.instruct?.(live.engineSession, updated)
-        sentInstructions = true
-      } else if (promptBlocks.length > 0 || live.spec.kind === 'acp' || live.spec.kind === 'claude') {
-        promptBlocks = mergeTextBlocks([{ type: 'text', text: updated }, ...promptBlocks])
-        sentInstructions = true
+    const backgroundOnly = !fresh && remaining.length === 0 && !answeredOpenCall && (live.background || hasBackgroundWake)
+    if (backgroundOnly && !live.background && live.events.length === 0 && !resolvedTool) {
+      const last = messages.at(-1)
+      if (last !== undefined) {
+        live.handedBefore = live.handed
+        live.handed = last.id
+        this.deps.saveRecord(sessionId, this.recordOf(live, { cwd, promptHash: live.promptHash ?? promptHash, model: options.model }))
+      }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
+
+    if (backgroundOnly && live.background) {
+      // The CLI woke on its own (e.g. a finished background task or subagent) and is
+      // already streaming events without an active session/prompt from DSH.
+      live.state = 'running'
+    } else {
+      let promptBlocks = fresh
+        ? await renderReplay(messages, system, resolveImage)
+        : (live.spec.kind === 'acp' && remaining.length === 0) ? [] : await renderDelta(contextText, remaining, resolveImage)
+      let sentInstructions = live.spec.kind !== 'acp' && freshCli && instructions !== undefined
+      // A new CLI session gets its instructions in the open args or the replay;
+      // the "updated" line is only for a session that saw older ones.
+      if (instructions !== undefined && !freshCli && live.promptHash !== promptHash) {
+        const updated = `Updated team instructions (replace earlier ones):\n\n${instructions}`
+        if (live.spec.kind === 'codex') {
+          await live.engine.instruct?.(live.engineSession, updated)
+          sentInstructions = true
+        } else if (promptBlocks.length > 0 || ((live.spec.kind === 'acp' || live.spec.kind === 'claude') && live.state === 'idle')) {
+          promptBlocks = mergeTextBlocks([{ type: 'text', text: updated }, ...promptBlocks])
+          sentInstructions = true
+        }
+      }
+      // A card can outlive the CLI's turn: the CLI finished — often by timing out on the
+      // call it bridged out — while the user was still deciding. The answer then has to
+      // start a turn of its own, or the user's decision never reaches the agent and the
+      // stream ends by reading the finished turn's old reply (#1513).
+      let settledText = ''
+      if (settled.length > 0) {
+        const answer = settled.map(entry => `${entry.name} → ${entry.text === '' ? (entry.isError ? 'failed' : 'no result') : entry.text}`).join('\n')
+        settledText = `The calls that were waiting on the user are settled:\n\n${answer}\n\nContinue from where the turn stopped.`
+      }
+      if (settledText !== '' && live.engine.canSteer?.(live.engineSession) === false) {
+        // The turn this answer belongs to is over: it needs a turn of its own, in the same
+        // prompt as whatever else this call brought — runtime context, a further user
+        // message — because context alone would carry the turn without the decision.
+        const extraCtx = promptBlocks.length === 0 && contextText !== '' ? [{ type: 'text', text: contextText }] : []
+        const blocks = mergeTextBlocks([{ type: 'text', text: settledText }, ...extraCtx, ...promptBlocks])
+        this.discardTurnOutput(live)
+        if (sentInstructions) live.promptHash = promptHash
+        promptBlocks = []
+        await this.startTurn(live, blocks, options.signal, options.reasoningEffort)
+      } else if (settledText !== '') {
+        // The turn still looks alive; if it ends without reading the answer, the drain
+        // starts the turn that carries it.
+        live.continuation = promptBlocks.length === 0 && contextText !== '' ? `${settledText}\n\n${contextText}` : settledText
+        if (live.state === 'suspended' && live.pending.size === 0) live.state = 'running'
+      }
+      if (promptBlocks.length > 0) {
+        await this.sendInput(live, promptBlocks, options.signal, options.reasoningEffort, settledText)
+        if (sentInstructions) live.promptHash = promptHash
+        // ACP only counts instructions once they reach the agent with a prompt.
+        if (live.spec.kind === 'acp' && (freshCli || sentInstructions)) live.promptHash = promptHash
+      }
+      if (live.spec.kind === 'acp' && freshCli && promptBlocks.length === 0 && instructions !== undefined) {
+        await this.sendInput(live, `Follow these instructions from the user's team for everything you do here. They sit on top of your own; when they conflict, these win.\n\n${instructions}`, options.signal, options.reasoningEffort)
+        live.promptHash = promptHash
       }
     }
-    // A card can outlive the CLI's turn: the CLI finished — often by timing out on the
-    // call it bridged out — while the user was still deciding. The answer then has to
-    // start a turn of its own, or the user's decision never reaches the agent and the
-    // stream ends by reading the finished turn's old reply (#1513).
-    let settledText = ''
-    if (settled.length > 0) {
-      const answer = settled.map(entry => `${entry.name} → ${entry.text === '' ? (entry.isError ? 'failed' : 'no result') : entry.text}`).join('\n')
-      settledText = `The calls that were waiting on the user are settled:\n\n${answer}\n\nContinue from where the turn stopped.`
-    }
-    if (settledText !== '' && live.engine.canSteer?.(live.engineSession) === false) {
-      // The turn this answer belongs to is over: it needs a turn of its own, in the same
-      // prompt as whatever else this call brought — runtime context, a further user
-      // message — because context alone would carry the turn without the decision.
-      const blocks = mergeTextBlocks([{ type: 'text', text: settledText }, ...promptBlocks])
-      this.discardTurnOutput(live)
-      if (sentInstructions) live.promptHash = promptHash
-      promptBlocks = []
-      await this.startTurn(live, blocks, options.signal, options.reasoningEffort)
-    } else if (settledText !== '') {
-      // The turn still looks alive; if it ends without reading the answer, the drain
-      // starts the turn that carries it.
-      live.continuation = settledText
-    }
-    if (promptBlocks.length > 0) {
-      await this.sendInput(live, promptBlocks, options.signal, options.reasoningEffort, settledText)
-      if (sentInstructions) live.promptHash = promptHash
-      // ACP only counts instructions once they reach the agent with a prompt.
-      if (live.spec.kind === 'acp' && (freshCli || sentInstructions)) live.promptHash = promptHash
-    }
-    if (live.spec.kind === 'acp' && freshCli && promptBlocks.length === 0 && instructions !== undefined) {
-      await this.sendInput(live, `Follow these instructions from the user's team for everything you do here. They sit on top of your own; when they conflict, these win.\n\n${instructions}`, options.signal, options.reasoningEffort)
-      live.promptHash = promptHash
-    }
+    this.markSteerPending(sessionId)
 
     // The last DSH message is handed now; a later call sends only what follows.
     // The marker before it is kept: a start that fails before the CLI reads
@@ -588,13 +745,31 @@ export class LocalAgentAdapter extends LlmAdapter {
     const blocks = typeof input === 'string' ? [{ type: 'text', text: input }] : input
     const steerInput = typeof input === 'string' ? input : blocks
     live.mute = false
+    if (live.bgAbort !== undefined) {
+      live.bgAbort.abort()
+      live.bgAbort = undefined
+    }
+    if (live.background && live.state === 'idle') {
+      live.state = 'running'
+    }
     // A settled answer rides with the input: if this input cannot land as a steer, the
     // turn that replaces it must still carry what the user decided (#1513).
     const body = settled === undefined || settled === ''
       ? blocks
       : mergeTextBlocks([{ type: 'text', text: settled }, ...blocks])
     if (live.state !== 'idle') {
-      if (live.spec.kind === 'acp') { live.queue.push(blocks); return Promise.resolve() }
+      if (live.spec.hookSteer === true && live.engine.canSteer?.(live.engineSession) !== false) {
+        const text = body.filter(block => block.type === 'text').map(block => block.text).join('\n\n')
+        if (text !== '') {
+          live.steerQueue.push(text)
+          const cliSessionId = live.engineSession?.acpSessionId ?? live.cliSessionId
+          if (cliSessionId !== undefined) live.engine.setSteerPending?.(cliSessionId, true)
+        }
+        const nonText = body.filter(block => block.type !== 'text')
+        if (nonText.length > 0) live.queue.push(nonText)
+        return Promise.resolve()
+      }
+      if (live.spec.kind === 'acp') { live.queue.push(body); return Promise.resolve() }
       // Steering lands on a turn that is still running. When the CLI finished the
       // turn behind a card — the usual case for an answer that arrives late — the
       // steer has nothing to land on, and dropping it leaves the user's answer
@@ -682,6 +857,58 @@ export class LocalAgentAdapter extends LlmAdapter {
     }
   }
 
+  wakeBackground(live) {
+    if (typeof this.deps.onBackgroundWake !== 'function') {
+      void this.drainOrphanBackground(live)
+      return
+    }
+    Promise.resolve(this.deps.onBackgroundWake(live.sessionId))
+      .then((woke) => {
+        if (!woke && live.background && live.state === 'idle') void this.drainOrphanBackground(live)
+      })
+      .catch(() => {
+        if (live.background && live.state === 'idle') void this.drainOrphanBackground(live)
+      })
+  }
+
+  async drainOrphanBackground(live) {
+    const ac = new AbortController()
+    live.bgAbort = ac
+    let textBuf = ''
+    const idleMs = this.deps.bgIdleSettleMs ?? BG_IDLE_SETTLE_MS
+    const activeMs = this.deps.bgActiveSettleMs ?? BG_ACTIVE_SETTLE_MS
+    const abortPromise = new Promise(resolve => ac.signal.addEventListener('abort', () => resolve({ type: 'bg-abort' }), { once: true }))
+    try {
+      while (!live.dead && !ac.signal.aborted && live.background && live.state === 'idle') {
+        const event = await Promise.race([live.next(textBuf !== '' ? idleMs : activeMs), abortPromise])
+        if (event.type === 'bg-abort' || live.dead || live.state !== 'idle') break
+        if (event.type === 'bg-settle' || event.type === 'done') {
+          if (textBuf.trim() !== '') {
+            const out = textBuf
+            textBuf = ''
+            await Promise.resolve(this.deps.onBackgroundText?.(live.sessionId, out)).catch(() => {})
+          }
+          live.background = false
+          break
+        } else if (event.type === 'text') {
+          textBuf += event.text
+        } else if (event.type === 'permission') {
+          const answer = presetAnswer(this.deps.presetFor(live.sessionId), event)
+          event.reply(answer ?? null)
+        } else if (event.type === 'call') {
+          const pending = live.pending.get(event.dshCallId)
+          live.pending.delete(event.dshCallId)
+          pending?.resolve({ text: 'session unavailable in background', isError: true })
+        }
+      }
+    } finally {
+      if (live.bgAbort === ac) live.bgAbort = undefined
+      if (live.background && live.state === 'idle' && !ac.signal.aborted) {
+        live.background = false
+      }
+    }
+  }
+
   // Consume the CLI's events until the turn ends or a bridged call suspends it.
   async *drain(live, options) {
     let index = 0
@@ -689,6 +916,18 @@ export class LocalAgentAdapter extends LlmAdapter {
     let textIndex = -1
     let thinkBuf = ''
     let thinkIndex = -1
+    let hasText = false
+    let lastTouchAt = 0
+    const pendingStepTexts = []
+    const bgIdleMs = this.deps.bgIdleSettleMs ?? BG_IDLE_SETTLE_MS
+    const bgActiveMs = this.deps.bgActiveSettleMs ?? BG_ACTIVE_SETTLE_MS
+    const touchStream = () => {
+      const now = Date.now()
+      if (now - lastTouchAt >= 5_000) {
+        lastTouchAt = now
+        this.deps.onStreamTouch?.(live.sessionId)
+      }
+    }
     // DSH keeps the last usage chunk of a request, and a CLI may report each of its
     // model calls (Codex): the chunk carries the sum.
     let usage
@@ -697,8 +936,17 @@ export class LocalAgentAdapter extends LlmAdapter {
       return { type: 'usage', usage }
     }
     // Open text and reasoning stay open in parallel; each closes when it has to.
+    const closeTextBlock = function* () {
+      if (textIndex !== -1) {
+        const closed = textBuf
+        yield { type: 'block-end', index: textIndex, block: { type: 'text', text: closed } }
+        textIndex = -1
+        textBuf = ''
+        if (closed.trim() !== '') pendingStepTexts.push(closed)
+      }
+    }
     const closeBlocks = function* () {
-      if (textIndex !== -1) { yield { type: 'block-end', index: textIndex, block: { type: 'text', text: textBuf } }; textIndex = -1; textBuf = '' }
+      yield* closeTextBlock()
       if (thinkIndex !== -1) { yield { type: 'block-end', index: thinkIndex, block: { type: 'reasoning', text: thinkBuf } }; thinkIndex = -1; thinkBuf = '' }
     }
     const emitCalls = (calls) => {
@@ -723,7 +971,8 @@ export class LocalAgentAdapter extends LlmAdapter {
     else options.signal?.addEventListener('abort', onAbort)
     try {
     for (;;) {
-      const event = await Promise.race([live.next(), abortPromise]).catch(error => ({ type: 'abort', error }))
+      const settleMs = live.background ? (hasText ? bgIdleMs : bgActiveMs) : undefined
+      const event = await Promise.race([live.next(settleMs), abortPromise]).catch(error => ({ type: 'abort', error }))
       if (event.type === 'abort') {
         this.stopTurn(live, 'the turn was stopped')
         yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'the turn was stopped' } } }
@@ -733,6 +982,8 @@ export class LocalAgentAdapter extends LlmAdapter {
       if (event.type !== 'permission' && event.type !== 'call' && event.turnId !== undefined && live.turnTag !== undefined && event.turnId !== live.turnTag) continue
       switch (event.type) {
         case 'text': {
+          touchStream()
+          hasText = true
           if (textIndex === -1) {
             if (thinkIndex !== -1) { yield { type: 'block-end', index: thinkIndex, block: { type: 'reasoning', text: thinkBuf } }; thinkIndex = -1; thinkBuf = '' }
             yield { type: 'block-start', index: index++, blockType: 'text' }
@@ -744,19 +995,28 @@ export class LocalAgentAdapter extends LlmAdapter {
         }
         case 'thought':
         case 'activity': {
+          touchStream()
           // An activity line stands on its own line of the reasoning, which is
           // how the chat tells it from the thought around it.
           const text = event.type === 'activity' ? `${thinkBuf === '' || thinkBuf.endsWith('\n') ? '' : '\n'}${event.text}\n` : event.text
           if (thinkIndex === -1) {
-            if (textIndex !== -1) { yield { type: 'block-end', index: textIndex, block: { type: 'text', text: textBuf } }; textIndex = -1; textBuf = '' }
+            yield* closeTextBlock()
             yield { type: 'block-start', index: index++, blockType: 'reasoning' }
             thinkIndex = index - 1
           }
+          if (event.type === 'activity') this.deps.onCliWork?.(live.sessionId, pendingStepTexts.splice(0))
           thinkBuf += text
           yield { type: 'reasoning-delta', index: thinkIndex, text }
           break
         }
         case 'usage': yield addUsage(event.usage); break
+        case 'touch': touchStream(); break
+        case 'steered': {
+          if (!this.deps.hasInboxSteers?.(live.sessionId)) break
+          yield* closeBlocks()
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
         case 'call': {
           yield* closeBlocks()
           live.state = 'suspended'
@@ -779,11 +1039,12 @@ export class LocalAgentAdapter extends LlmAdapter {
           yield { type: 'finish', reason: { kind: 'tool-calls' } }
           return
         }
+        case 'bg-settle':
         case 'done': {
           // The answer resolved a call this turn never read — it ended while the user
           // was still deciding. Nothing was said after that answer, so start the turn
           // that carries it instead of ending on the finished turn's old reply (#1513).
-          if (live.continuation !== undefined && index === 0) {
+          if (event.type === 'done' && live.continuation !== undefined && index === 0) {
             const continuation = live.continuation
             live.continuation = undefined
             this.discardTurnOutput(live)
@@ -793,11 +1054,20 @@ export class LocalAgentAdapter extends LlmAdapter {
           live.continuation = undefined
           yield* closeBlocks()
           if (event.usage !== undefined) yield addUsage(event.usage)
+          const wasBackground = live.background
+          live.background = false
           live.state = 'idle'
+          if (wasBackground) void Promise.resolve(this.deps.onBackgroundSettled?.(live.sessionId)).catch(() => {})
+          if (live.steerQueue.length > 0) {
+            const cliSessionId = live.engineSession?.acpSessionId ?? live.cliSessionId
+            if (cliSessionId !== undefined) live.engine.setSteerPending?.(cliSessionId, false)
+            live.queue.unshift([{ type: 'text', text: live.steerQueue.splice(0).join('\n\n') }])
+          }
           // Input queued while this turn ran goes out as the next prompt
           // inside the same drain (ACP takes one prompt at a time).
           const next = live.queue.shift()
           if (next !== undefined) {
+            hasText = false
             this.sendInput(live, next, options.signal, options.reasoningEffort)
             break
           }
@@ -805,6 +1075,7 @@ export class LocalAgentAdapter extends LlmAdapter {
           return
         }
         case 'error': {
+          live.background = false
           live.state = 'idle'
           throw toLlmError(event.error, live)
         }
@@ -858,7 +1129,7 @@ export class LocalAgentAdapter extends LlmAdapter {
       await this.openFor(live, sessionId)
       opened = true
     }
-    if (live.state !== 'idle' || live.pending.size > 0) throw new LlmError('the local agent is in the middle of a turn', 'LOCAL_AGENT_BUSY')
+    if (live.state !== 'idle' || live.background || live.pending.size > 0) throw new LlmError('the local agent is in the middle of a turn', 'LOCAL_AGENT_BUSY')
     // What a finished turn left behind is not this request's answer.
     live.events.length = 0
     try {
@@ -1127,7 +1398,7 @@ async function renderDelta(contextText, remaining, resolveImage) {
 async function renderReplay(messages, system, resolveImage) {
   const picked = []
   let used = 0
-  const body = (messages ?? []).filter(message => message.role !== 'system')
+  const body = (messages ?? []).filter(message => message.role !== 'system' && !isBackgroundWake(message))
   const latest = body.at(-1)
   let full = false
   for (const message of [...body].reverse()) {

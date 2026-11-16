@@ -21,7 +21,7 @@ const CLIS = {
   'copilot-cli': { name: 'GitHub Copilot', kind: 'acp', command: 'copilot', args: ['--acp'], version: ['--version'], signIn: 'copilot' },
   'gemini-cli': { name: 'Gemini CLI', kind: 'acp', command: 'gemini', args: ['--acp'], version: ['--version'], signIn: 'gemini', signedIn: { file: ['.gemini', 'oauth_creds.json'] } },
   'antigravity': {
-    name: 'Antigravity', kind: 'acp', command: 'agy', args: ['acp'], version: ['--version'], signIn: 'agy acp --login',
+    name: 'Antigravity', kind: 'acp', hookSteer: true, command: 'agy', args: ['acp'], version: ['--version'], signIn: 'agy acp --login',
     cwdPerProcess: true,
     modes: {
       'read-only': ['default'],
@@ -111,3 +111,7 @@ export const acpMode = (preset, advertised, modes) => {
 // Codex and Claude take a fixed mode; an ACP engine maps the preset itself once
 // its session lists the modes (acpMode).
 export const cliMode = (kind, preset) => (kind === 'acp' ? undefined : MODES[preset]?.[kind])
+
+// Engines that accept mid-turn steering without cancelling the active turn.
+export const canSteerEngine = spec => spec !== undefined
+  && (spec.kind === 'codex' || spec.kind === 'claude' || spec.hookSteer === true)

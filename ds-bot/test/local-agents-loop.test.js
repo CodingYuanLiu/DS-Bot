@@ -13,35 +13,49 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { mountAgentLoopTestDependencies, mountAgentLoopTestHarness } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { LocalAgentAdapter } from '../src/host/local-agents/adapter.js'
 import { AcpEngine } from '../src/host/local-agents/acp.js'
+import { textOf } from '../src/host/text.js'
 import { output } from '../src/host/tools.js'
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/fake-acp.mjs', import.meta.url))
 const TEAM = ['message_bot', 'approve_agent_action']
 
-function makeAdapter(ctx, records = {}) {
+function makeAdapter(ctx, records = {}, extra = {}) {
+  const agyHomeDir = mkdtempSync(join(tmpdir(), 'dsb-loop-agy-'))
   return new LocalAgentAdapter({
     rt: { warn: () => {}, ctx },
     customAgents: () => [{ id: 'fake', name: 'Fake ACP', command: 'x', args: [] }],
     findExecutable: path => path,
-    spawnEngine: (kind, route, spec) => new AcpEngine(route, { ...spec, command: process.execPath, args: [FIXTURE] }, { findExecutable: path => path }),
+    spawnEngine: (kind, route, spec, hooks = {}) => new AcpEngine(
+      route,
+      { ...spec, command: process.execPath, args: [FIXTURE, ...(route === 'local-antigravity' ? ['--agy'] : [])] },
+      { findExecutable: path => path, agyHomeDir, ...hooks },
+    ),
     record: sessionId => records[sessionId],
     saveRecord: (sessionId, record) => { records[sessionId] = record },
     presetFor: () => 'workspace-write',
     cwdFor: async () => mkdtempSync(join(tmpdir(), 'dsb-cwd-')),
     probeCwd: () => mkdtempSync(join(tmpdir(), 'dsb-probe-')),
     toolsFor: options => (options.tools ?? []).filter(tool => TEAM.includes(tool.name)),
+    ...extra,
   })
 }
 
-async function boot({ approval, attachmentsHome } = {}) {
+async function boot({ approval, attachmentsHome, adapterDeps, provider = 'local-acp-fake' } = {}) {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   if (attachmentsHome !== undefined) ctx.plugin(LocalAttachmentStore, { dshHome: attachmentsHome })
-  const adapter = makeAdapter(ctx)
-  ctx.llm.registerAdapter(['local-acp-fake'], adapter)
+  const isSteerable = msg => msg?.role === 'user' && msg.source?.kind !== 'runtime-context' && msg.source?.role !== 'background'
+  const adapter = makeAdapter(ctx, {}, {
+    peekInboxSteers: (sessionId, excludeIds) => (ctx.agents?.get(sessionId)?.inbox?.nextStep ?? [])
+      .filter(msg => isSteerable(msg) && !(excludeIds?.has(msg.id)))
+      .map(msg => ({ id: msg.id, text: textOf(msg.content) })),
+    hasInboxSteers: sessionId => (ctx.agents?.get(sessionId)?.inbox?.nextStep ?? []).some(isSteerable),
+    ...adapterDeps,
+  })
+  ctx.llm.registerAdapter(['local-acp-fake', 'local-antigravity'], adapter)
   if (approval !== undefined) ctx.provide('approval', approval)
   await mountAgentLoopTestHarness(ctx)
-  const agent = await ctx.agentLoop.create(SessionId('s1'), { provider: 'local-acp-fake', model: 'default' })
+  const agent = await ctx.agentLoop.create(SessionId('s1'), { provider, model: 'default' })
   return { ctx, agent, adapter }
 }
 
@@ -146,4 +160,84 @@ test('user image saved in LocalAttachmentStore reaches the local agent through t
   }))
   await waitForIdle(ctx, agent)
   assert.match(texts(agent), new RegExp(`"mimeType":"${stored.ref.mediaType}","data":"${expectedBase64}"`))
+})
+
+test('spontaneous ACP background wakeup opens a real DSH turn and settles a valid assistant/message into Session', async (t) => {
+  let agentRef
+  const { ctx, agent, adapter } = await boot({
+    adapterDeps: {
+      bgIdleSettleMs: 60,
+      bgActiveSettleMs: 300,
+      onBackgroundWake: async () => {
+        if (!agentRef) return false
+        agentRef.followup(createUserMessage({
+          content: [{ type: 'text', text: '[Background update]' }],
+          source: { kind: 'bot', form: 'relay', role: 'background' },
+        }))
+        return true
+      },
+    },
+  })
+  agentRef = agent
+  t.after(async () => { await adapter.dispose(); await ctx.fiber.dispose() })
+
+  const calls = []
+  ctx.tools.register({
+    name: 'message_bot',
+    description: 'Message another Bot',
+    parameters: { type: 'object', properties: { to: { type: 'string' }, message: { type: 'string' } } },
+    output,
+    async execute(args) { calls.push(args); return `delivered to ${args.to}` },
+  })
+
+  // Turn 1 finishes immediately while background work continues inside the ACP process.
+  const secondTurnDone = new Promise((resolve) => {
+    let idleCount = 0
+    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
+      if (subject === agent && status === 'idle') {
+        idleCount += 1
+        if (idleCount >= 2) { dispose(); resolve() }
+      }
+    })
+  })
+  send(agent, 'run bg-wakeup-mcp')
+  await secondTurnDone
+
+  const assistantEvents = agent.session.snapshotEvents().filter(event => event.type === 'assistant/message')
+  assert.equal(assistantEvents.length >= 2, true)
+  assert.match(texts(agent), /started in background/)
+  assert.match(texts(agent), /background finished: delivered to Chief/)
+  assert.equal(calls.length, 1)
+  for (const end of agent.session.snapshotEvents().filter(event => event.type === 'turn/end')) {
+    assert.equal(end.data.reason.kind, 'completed')
+  }
+})
+
+test('antigravity hook steer injects mid-turn user input at PostInvocation and Stop without cancelling or duplicating the prompt', async (t) => {
+  const { ctx, agent, adapter } = await boot({ provider: 'local-antigravity' })
+  t.after(async () => { await adapter.dispose(); await ctx.fiber.dispose() })
+
+  // 1. Mid-turn steer caught by PostInvocation hook (`injectSteps` + `force_continue`).
+  const done1 = waitForIdle(ctx, agent)
+  send(agent, 'run hook-steer now')
+  await new Promise(resolve => setTimeout(resolve, 15))
+  agent.steer(createUserMessage({ content: [{ type: 'text', text: 'use port 8080 instead' }], source: { kind: 'user' } }))
+  await done1
+
+  const events1 = agent.session.snapshotEvents()
+  assert.equal(events1.filter(event => event.type === 'turn/start').length, 1, 'completes inside a single DSH turn')
+  assert.equal(events1.findLast(event => event.type === 'turn/end')?.data.reason.kind, 'completed')
+  const seqStep1 = events1.findIndex(event => event.type === 'assistant/message' && JSON.stringify(event.data).includes('step1 working'))
+  const seqUserSteer = events1.findIndex(event => event.type === 'user/message' && JSON.stringify(event.data).includes('use port 8080 instead'))
+  const seqStep2 = events1.findIndex(event => event.type === 'assistant/message' && JSON.stringify(event.data).includes('steered: use port 8080 instead'))
+  assert.ok(seqStep1 >= 0 && seqUserSteer > seqStep1 && seqStep2 > seqUserSteer, 'user steer bubble sits cleanly between Step 1 and Step 2 outputs')
+  assert.doesNotMatch(texts(agent), /ok: .*use port 8080 instead/, 'steered input must not fire a second session/prompt')
+
+  // 2. Late steer caught at Stop hook (`decision: continue` -> `PreInvocation` `injectSteps`).
+  const done2 = waitForIdle(ctx, agent)
+  send(agent, 'run hook-steer-stop now')
+  await new Promise(resolve => setTimeout(resolve, 15))
+  agent.steer(createUserMessage({ content: [{ type: 'text', text: 'check edge cases too' }], source: { kind: 'user' } }))
+  await done2
+  assert.match(texts(agent), /stop-steered: check edge cases too/)
 })

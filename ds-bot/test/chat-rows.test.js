@@ -173,3 +173,13 @@ test('a marked final reply stacks onto earlier progress and keeps later messages
   assert.deepEqual(stacked[1].texts, ['Follow-up'])
   assert.equal(stacked[1].claims, undefined)
 })
+
+test('a background wakeup trigger renders CellEmpty so only the Bot reply bubble appears in chat', () => {
+  const team = { ...roster, roomsById: {}, exchangeTurns: {} }
+  const cell = TriggerCell({
+    node: { data: { source: { kind: 'bot', form: 'relay', role: 'background' }, turn: 2, time: 1, content: [{ type: 'text', text: '[Background update]' }] } },
+    sessionId: 'b', useRoster: pick => pick(team), useSessions: pick => pick({ byId: {} }),
+    useTurnClock: pick => pick({}), useUi: pick => pick({}), actions: {},
+  })
+  assert.equal(cell.type.name, 'CellEmpty')
+})

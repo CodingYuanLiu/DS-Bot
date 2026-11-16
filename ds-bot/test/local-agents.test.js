@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -12,11 +12,15 @@ import { JsonRpcPeer, wireProcess } from '../src/host/local-agents/jsonrpc.js'
 import { ClaudeEngine } from '../src/host/local-agents/claude.js'
 import { LoopbackMcp, flattenSchema } from '../src/host/local-agents/mcp.js'
 import { cleanEnv } from '../src/host/local-agents/discover.js'
-import { ENGINES, validateCustom, isLocalAgentRoute, cliMode, acpMode } from '../src/host/local-agents/engines.js'
+import { ENGINES, canSteerEngine, validateCustom, isLocalAgentRoute, cliMode, acpMode } from '../src/host/local-agents/engines.js'
+import { AgySteerServer, ensureAgySteerPlugin, postAgySteer } from '../src/host/local-agents/agy-steer.js'
+import { install as localAgentsInstall } from '../src/host/local-agents/index.js'
 import { AGENT_BADGES, agentAvatar, badgeOf, isLocalRoute } from '../src/client/agent-routes.js'
+import { stripHeader } from '../src/client/text.js'
 import { INKS } from '../src/client/inks.js'
 import { install as partsInstall } from '../src/host/parts.js'
 import { install as modelsInstall } from '../src/host/models.js'
+import { install as turnsInstall } from '../src/host/turns.js'
 import { fakeContext } from './fake-ctx.js'
 
 const FIXTURE = name => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url))
@@ -27,17 +31,18 @@ const system = (id, text) => ({ id, role: 'system', content: [{ type: 'text', te
 const toolResult = (id, callId, text, isError = false) => ({ id, role: 'tool', content: [{ type: 'text', text }], toolCallId: callId, isError, source: { kind: 'tool', callId } })
 
 // An adapter wired to the fake CLIs: every engine route spawns `node fixture`.
-function makeAdapter({ records = {}, preset = 'workspace-write', acp = FIXTURES.acp, acpArgs = [], codex = FIXTURES.codex, codexArgs = [], claude = FIXTURES.claude, claudeArgs = [], cwdFor, attachments, fs, rt } = {}) {
+function makeAdapter({ records = {}, preset = 'workspace-write', acp = FIXTURES.acp, acpArgs = [], codex = FIXTURES.codex, codexArgs = [], claude = FIXTURES.claude, claudeArgs = [], cwdFor, attachments, fs, rt, onBackgroundWake, onBackgroundSettled, onBackgroundText, bgIdleSettleMs, bgActiveSettleMs, peekInboxSteers, hasInboxSteers, onStreamTouch, onCliWork } = {}) {
   const files = { acp, codex, claude }
   const spawned = []
+  const agyHomeDir = mkdtempSync(join(tmpdir(), 'dsb-agy-home-'))
   const adapter = new LocalAgentAdapter({
     rt: rt ?? { warn: () => {} },
     attachments,
     fs,
     customAgents: () => [{ id: 'fake', name: 'Fake ACP', command: 'x', args: [] }, { id: 'fake2', name: 'Fake ACP 2', command: 'x', args: [] }],
     findExecutable: path => path,
-    spawnEngine: (kind, route, spec) => {
-      const engine = kind === 'acp' ? new AcpEngine(route, { ...spec, command: process.execPath, args: [files.acp, ...acpArgs] }, { findExecutable: path => path })
+    spawnEngine: (kind, route, spec, hooks = {}) => {
+      const engine = kind === 'acp' ? new AcpEngine(route, { ...spec, command: process.execPath, args: [files.acp, ...acpArgs] }, { findExecutable: path => path, agyHomeDir, ...hooks })
         : kind === 'codex' ? new CodexEngine(route, { ...spec, command: process.execPath, args: [files.codex, ...codexArgs] }, { findExecutable: path => path })
           : new ClaudeEngine(route, { ...spec, command: process.execPath, args: [files.claude, ...claudeArgs] }, { findExecutable: path => path })
       spawned.push(engine)
@@ -49,8 +54,18 @@ function makeAdapter({ records = {}, preset = 'workspace-write', acp = FIXTURES.
     cwdFor: cwdFor ?? (async () => mkdtempSync(join(tmpdir(), 'dsb-cwd-'))),
     probeCwd: () => mkdtempSync(join(tmpdir(), 'dsb-probe-')),
     toolsFor: () => [{ name: 'message_bot', description: 'Message another Bot', parameters: { type: 'object', properties: { bot: { type: 'string' }, text: { type: 'string' } } } }],
+    peekInboxSteers,
+    hasInboxSteers,
+    onStreamTouch,
+    onCliWork,
+    onBackgroundWake,
+    onBackgroundSettled,
+    onBackgroundText,
+    bgIdleSettleMs,
+    bgActiveSettleMs,
   })
   adapter._spawned = spawned
+  adapter._agyHomeDir = agyHomeDir
   return adapter
 }
 
@@ -121,9 +136,11 @@ test('the MCP bridge suspends the turn and the next stream answers it', async (t
   assert.equal(first.finish.kind, 'tool-calls')
   assert.equal(first.calls.length, 1)
   assert.equal(first.calls[0].name, 'message_bot')
-  const second = await collect(adapter.stream(options('s1', [user('m1', 'please call-tool now'), toolResult('m2', first.calls[0].id, 'Kai says hi back')])))
+  const step2Context = { id: 'rc-step2', role: 'user', content: [{ type: 'text', text: 'Time sampled while preparing turn 1, step 2: 2026-11-16T13:40:00+08:00' }], source: { kind: 'runtime-context' } }
+  const second = await collect(adapter.stream(options('s1', [user('m1', 'please call-tool now'), toolResult('m2', first.calls[0].id, 'Kai says hi back'), step2Context])))
   assert.equal(second.finish.kind, 'stop')
   assert.match(second.text, /tool said: Kai says hi back/)
+  assert.doesNotMatch(second.text, /ok: Time sampled/, 'step-2 runtime-context must not queue a second ACP prompt')
 })
 
 test('queued calls finish later streams', async (t) => {
@@ -1696,4 +1713,319 @@ test('replay drops images outside the replay window without reading their attach
   const out = await collect(adapter.stream(options('s1', msgs, { provider: 'local-codex-cli', model: 'gpt-5.1-codex' })))
   assert.equal(out.finish?.kind, 'stop')
   assert.deepEqual(readIds, ['att-recent'])
+})
+
+test('acp background wakeup drives a real DSH turn, supports bridged MCP calls, and leaves no leaked waiters', async (t) => {
+  let wakeResolve
+  const woke = new Promise(resolve => { wakeResolve = resolve })
+  const settled = []
+  const wakes = []
+  const adapter = makeAdapter({
+    bgIdleSettleMs: 60,
+    bgActiveSettleMs: 300,
+    onBackgroundWake: async (sessionId) => {
+      wakes.push(sessionId)
+      wakeResolve(sessionId)
+      return true
+    },
+    onBackgroundSettled: async (sessionId) => {
+      settled.push(sessionId)
+    },
+  })
+  t.after(() => adapter.dispose())
+
+  // 1. Initial user turn starts background work and finishes immediately.
+  const first = await collect(adapter.stream(options('s1', [user('m1', 'please run bg-wakeup-mcp')])))
+  assert.equal(first.text, 'started in background')
+  assert.equal(first.finish.kind, 'stop')
+
+  // 2. Spontaneous ACP updates wake the session once; DSH opens a background turn
+  //    (with runtime-context + [Background update]) without sending a new prompt.
+  assert.equal(await woke, 's1')
+  assert.deepEqual(wakes, ['s1'])
+  const rtCtx = { id: 'rc1', role: 'user', content: [{ type: 'text', text: 'Time sampled: 2026-11-16T13:30:00+08:00' }], source: { kind: 'runtime-context' } }
+  const bgWake = { id: 'bg1', role: 'user', content: [{ type: 'text', text: '[Background update]' }], source: { kind: 'bot', form: 'relay', role: 'background' } }
+  const step1 = await collect(adapter.stream(options('s1', [user('m1', 'please run bg-wakeup-mcp'), rtCtx, bgWake])))
+  assert.equal(step1.finish.kind, 'tool-calls')
+  assert.equal(step1.calls[0]?.name, 'message_bot')
+  assert.match(step1.thinking, /checking background output/)
+  assert.match(step1.thinking, /▸ Run `cat out\.log`/)
+
+  // 3. Tool result resumes the background turn and settles cleanly into the chat stream.
+  const step2 = await collect(adapter.stream(options('s1', [
+    user('m1', 'please run bg-wakeup-mcp'),
+    rtCtx,
+    bgWake,
+    toolResult('tr1', step1.calls[0].id, 'Chief: ack'),
+  ])))
+  assert.equal(step2.finish.kind, 'stop')
+  assert.equal(step2.text, 'background finished: Chief: ack')
+  assert.deepEqual(settled, ['s1'])
+
+  // 4. Subsequent normal user turn receives its full first chunk (no leaked waiter from bg-settle).
+  const next = await collect(adapter.stream(options('s1', [
+    user('m1', 'please run bg-wakeup-mcp'),
+    rtCtx,
+    bgWake,
+    toolResult('tr1', step1.calls[0].id, 'Chief: ack'),
+    user('m2', 'follow up question'),
+  ])))
+  assert.equal(next.finish.kind, 'stop')
+  assert.match(next.text, /^ok: follow up question/)
+})
+
+test('local-agents install wires background wakeups as valid DSH user/messages and hides synthetic headers', async () => {
+  assert.equal(stripHeader('[Background update]'), '')
+  assert.equal(stripHeader('[Background update]\nextra'), 'extra')
+
+  let registeredAdapter
+  const ctx = fakeContext()
+  ctx.llm = {
+    registerAdapter: (_routes, adapter) => {
+      registeredAdapter = adapter
+      return Object.assign(() => {}, { replace: () => {} })
+    },
+  }
+  const flushed = []
+  ctx.sessions = { flush: async (session) => { flushed.push(session.id) } }
+  const nextTurn = []
+  const agent = {
+    id: 's1',
+    session: { id: 's1', header: { cwd: '/tmp' } },
+    inbox: {
+      nextTurn,
+      remove: (id) => {
+        const at = nextTurn.findIndex(item => item.id === id)
+        if (at !== -1) nextTurn.splice(at, 1)
+      },
+    },
+    followup: (msg) => { nextTurn.push(msg) },
+  }
+  const rt = {
+    ctx,
+    state: { bots: { b1: { id: 'b1', model: 'local-antigravity/default' } }, localAgents: { custom: [], sessions: {} } },
+    async save() {},
+    async load() {},
+    botOf: id => rt.state.bots[id],
+    selfOf: () => 'b1',
+    roomOf: () => undefined,
+    groupOwners: new Map(),
+    teamTools: [],
+    resolveAgent: async () => agent,
+  }
+  localAgentsInstall(rt)
+  assert.ok(registeredAdapter !== undefined)
+
+  const woke = await registeredAdapter.deps.onBackgroundWake('s1')
+  assert.equal(woke, true)
+  assert.equal(nextTurn.length, 1)
+  assert.equal(typeof nextTurn[0].id, 'string')
+  assert.ok(nextTurn[0].id.length > 0)
+  assert.deepEqual(nextTurn[0].source, { kind: 'bot', form: 'relay', role: 'background' })
+  assert.equal(flushed.length, 1)
+
+  // Duplicate wake while already queued does not push a second trigger.
+  await registeredAdapter.deps.onBackgroundWake('s1')
+  assert.equal(nextTurn.length, 1)
+
+  // Settling cleans up any unconsumed queued trigger.
+  await registeredAdapter.deps.onBackgroundSettled('s1')
+  assert.equal(nextTurn.length, 0)
+})
+
+test('agy-steer: Unix socket + marker gate no-ops in pure /bin/sh without a steer and injects PreInvocation / PostInvocation / Stop steers when pending', async (t) => {
+  assert.equal(canSteerEngine(ENGINES['local-antigravity']), true)
+  assert.equal(canSteerEngine(ENGINES['local-codex-cli']), true)
+  assert.equal(canSteerEngine(ENGINES['local-claude-code']), true)
+  assert.equal(canSteerEngine(ENGINES['local-cursor-cli']), false)
+
+  const homeDir = mkdtempSync(join(tmpdir(), 'dsb-agy-plugin-'))
+  const dir = ensureAgySteerPlugin({ homeDir })
+  assert.ok(dir !== undefined)
+  const hooksCfg = JSON.parse(readFileSync(join(dir, 'hooks.json'), 'utf8'))
+  const stepCmd = hooksCfg['dsbot-steer'].PostInvocation[0].command
+  const stopCmd = hooksCfg['dsbot-steer'].Stop[0].command
+
+  const runShellHook = (command, stdinObj, envOver = {}) => new Promise((resolve, reject) => {
+    const child = process.platform === 'win32'
+      ? spawn(process.execPath, [join(dir, 'steer-hook.mjs')], { cwd: dir, env: { ...process.env, ...envOver }, stdio: ['pipe', 'pipe', 'pipe'] })
+      : spawn('/bin/sh', ['-c', command], { cwd: dir, env: { ...process.env, ...envOver }, stdio: ['pipe', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', chunk => { out += chunk })
+    child.on('error', reject)
+    child.on('exit', code => (code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`exit ${code}`))))
+    child.stdin.end(JSON.stringify(stdinObj))
+  })
+
+  // 1. Standalone terminal agy (no DSBOT_STEER_DIR): immediate {} in pure /bin/sh.
+  const standalone = await runShellHook(stepCmd, { conversationId: 'c1', hookEventName: 'PostInvocation' }, { DSBOT_STEER_DIR: '', DSBOT_STEER_SOCK: '', DSBOT_STEER_TOKEN: '' })
+  assert.deepEqual(standalone, {})
+
+  // 2. Active AgySteerServer over private Unix socket (on POSIX) + marker gate.
+  let hits = 0
+  const queues = new Map([['c1', ['first steer', 'second steer']], ['c2', ['late steer']]])
+  const server = new AgySteerServer({
+    drain: (id) => { hits += 1; return (queues.get(id) ?? []).splice(0) },
+    hasPending: id => (queues.get(id)?.length ?? 0) > 0,
+  })
+  const steerEnv = await server.listen()
+  t.after(() => server.close())
+  if (process.platform !== 'win32') {
+    assert.ok(typeof server.socketPath === 'string' && existsSync(server.socketPath), 'listens on a Unix domain socket instead of a random TCP port')
+    assert.equal(server.url, undefined)
+  }
+
+  // Inside DS Bot WITH ANTIGRAVITY_CONVERSATION_ID='c1' but BEFORE setPending('c1', true):
+  // pure /bin/sh marker gate exits immediately with {} without touching the socket!
+  if (process.platform !== 'win32') {
+    const gated = await runShellHook(stepCmd, { conversationId: 'c1', hookEventName: 'PostInvocation' }, { ...steerEnv, ANTIGRAVITY_CONVERSATION_ID: 'c1' })
+    assert.deepEqual(gated, {})
+    assert.equal(hits, 0, 'marker gate skips spawning node when no .steer file exists')
+  }
+
+  // Mark c1 pending -> marker file exists -> shell invokes steer-hook.mjs -> drains & unlinks marker!
+  server.setPending('c1', true)
+  assert.equal(existsSync(join(server.dir, 'c1.steer')), true)
+
+  // Wrong token fails open with {} so agy is never blocked.
+  const badToken = await runShellHook(stepCmd, { conversationId: 'c1', hookEventName: 'PostInvocation' }, { ...steerEnv, DSBOT_STEER_TOKEN: 'wrong', ANTIGRAVITY_CONVERSATION_ID: 'c1' })
+  assert.deepEqual(badToken, {})
+  assert.equal(queues.get('c1').length, 2, 'unauthorized call does not drain')
+
+  const postOut = await runShellHook(stepCmd, { conversationId: 'c1', hookEventName: 'PostInvocation' }, { ...steerEnv, ANTIGRAVITY_CONVERSATION_ID: 'c1' })
+  assert.deepEqual(postOut, {
+    injectSteps: [{ userMessage: 'first steer' }, { userMessage: 'second steer' }],
+    terminationBehavior: 'force_continue',
+  })
+  assert.equal(existsSync(join(server.dir, 'c1.steer')), false, 'marker file is removed automatically once drained')
+
+  // Stop with terminal USER_CANCELED never continues; Stop with NO_TOOL_CALL peeks without popping, sets marker, then PreInvocation drains.
+  assert.deepEqual(await runShellHook(stopCmd, { conversationId: 'c2', hookEventName: 'Stop', terminationReason: 'USER_CANCELED' }, { ...steerEnv, ANTIGRAVITY_CONVERSATION_ID: 'c2' }), {})
+  const stopOut = await runShellHook(stopCmd, { conversationId: 'c2', hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL' }, { ...steerEnv, ANTIGRAVITY_CONVERSATION_ID: 'c2' })
+  assert.equal(stopOut.decision, 'continue')
+  assert.equal(queues.get('c2').length, 1, 'Stop peeks without popping so PreInvocation injects userMessage')
+  assert.equal(existsSync(join(server.dir, 'c2.steer')), true, 'Stop arms c2.steer so the subsequent PreInvocation passes the shell gate')
+  const preOut = await runShellHook(stepCmd, { conversationId: 'c2', hookEventName: 'PreInvocation' }, { ...steerEnv, ANTIGRAVITY_CONVERSATION_ID: 'c2' })
+  assert.deepEqual(preOut, { injectSteps: [{ userMessage: 'late steer' }] })
+})
+
+test('acp (antigravity): unconsumed steerQueue items at turn end fall back to next prompt without loss', async (t) => {
+  const adapter = makeAdapter({ acpArgs: ['--agy'] })
+  t.after(() => adapter.dispose())
+  await collect(adapter.stream(options('s1', [user('m1', 'hello')], { provider: 'local-antigravity' })))
+  const live = adapter.live.get('s1')
+  assert.ok(live !== undefined)
+  live.steerQueue.push('arrived right before done')
+  const second = await collect(adapter.stream(options('s1', [user('m1', 'hello'), user('m2', 'next')], { provider: 'local-antigravity' })))
+  assert.match(second.text, /ok: next/)
+  assert.match(second.text, /ok: arrived right before done/)
+})
+
+test('group CLI turns touch the room waiter, switch to working on internal tools, and flush step bubbles without duplication at turn/end', async (t) => {
+  const ctx = fakeContext()
+  const stepPosts = []
+  const latePosts = []
+  let touches = 0
+  let works = 0
+  const rt = {
+    ctx,
+    state: { bots: { b1: { id: 'b1', name: 'DSHDev', model: 'local-antigravity/default' } }, rooms: { r1: { id: 'r1', members: ['b1'] } }, exchangeTurns: {}, questions: {}, views: {} },
+    async save() {},
+    async load() {},
+    warn() {},
+    noteFailure() {},
+    isBotSession: id => id === 'gs1',
+    roomOf: id => rt.state.rooms[id],
+    botOf: id => rt.state.bots[id],
+    selfOf: id => (id === 'gs1' ? 'b1' : undefined),
+    chatOf: () => 'dm1',
+    chatOwners: new Map(),
+    groupOwners: new Map([['gs1', { roomId: 'r1', botId: 'b1' }]]),
+    switchJobs: () => [],
+    sessionFolder: () => '/tmp',
+    touchRoomTurn: () => { touches += 1 },
+    workRoomTurn: () => { works += 1 },
+    roomStepText: async (_id, _info, text, first) => { stepPosts.push({ text, first }) },
+    lateRoomReply: async (_id, _info, reply, meta) => { latePosts.push({ reply, ...meta }) },
+  }
+  turnsInstall(rt)
+
+  const adapter = makeAdapter({
+    acpArgs: ['--agy'],
+    onStreamTouch: id => rt.touchRoomTurn(id),
+    onCliWork: (id, texts) => rt.noteCliWork(id, texts),
+  })
+  t.after(() => adapter.dispose())
+
+  const emit = async (type, data) => {
+    for (const fn of ctx.listeners.get('session/event') ?? []) {
+      if (fn.length >= 2) await fn({ id: 'gs1' }, { type, data })
+    }
+  }
+
+  await emit('turn/start', { turn: 1 })
+  await emit('user/message', {
+    content: [{ type: 'text', text: '[Group chat]\ndo work' }],
+    source: { kind: 'bot', role: 'room', roomId: 'r1', exchangeId: 'ex-1' },
+  })
+
+  const blocks = []
+  for await (const chunk of adapter.stream(options('gs1', [user('m1', 'run group-progress')], { provider: 'local-antigravity' }))) {
+    if (chunk.type === 'block-end') blocks.push(chunk.block)
+  }
+  assert.equal(touches >= 1, true, 'stream heartbeat touches the room waiter')
+  assert.equal(works, 2, 'each internal CLI tool marks the room turn as working')
+  assert.deepEqual(stepPosts, [
+    { text: 'Opening note before tools.', first: true },
+    { text: 'Milestone halfway done.', first: false },
+  ])
+
+  await emit('assistant/message', { message: { role: 'assistant', content: blocks } })
+  await emit('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  assert.equal(latePosts.length, 1)
+  assert.equal(latePosts[0].reply, 'Final result delivered.')
+  assert.equal(latePosts[0].shown, true)
+  assert.equal(latePosts[0].toolCount, 2)
+})
+
+test('acp session/load drops historical replay notifications arriving both before and after the load RPC reply', async (t) => {
+  const records = { s1: { route: 'local-antigravity', cliSessionId: 'acp-resumed-1', handedId: 'm1', model: 'default' } }
+  const adapter = makeAdapter({ records, acpArgs: ['--agy', '--replay-on-load'] })
+  t.after(() => adapter.dispose())
+
+  const out = await collect(adapter.stream(options('s1', [user('m1', 'old'), user('m2', 'fresh command')], { provider: 'local-antigravity' })))
+  assert.equal(out.finish.kind, 'stop')
+  assert.match(out.text, /^ok: fresh command/)
+  assert.doesNotMatch(out.text, /STALE_/)
+  assert.doesNotMatch(out.thinking, /STALE_/)
+})
+
+test('Stop hook fullyIdle:false protects long in-process agy subagents from 10-minute idle session GC', async (t) => {
+  const adapter = makeAdapter({ acpArgs: ['--agy'] })
+  t.after(() => adapter.dispose())
+
+  await collect(adapter.stream(options('s1', [user('m1', 'start subagent')], { provider: 'local-antigravity' })))
+  const live = adapter.live.get('s1')
+  const engine = adapter.engines.get('local-antigravity')
+  assert.ok(live !== undefined && engine?.steerServer !== undefined)
+
+  const reportStop = (fullyIdle) => postAgySteer(engine.steerServer, {
+    conversationId: live.cliSessionId,
+    hookEventName: 'Stop',
+    terminationReason: 'NO_TOOL_CALL',
+    fullyIdle,
+  })
+
+  await reportStop(false)
+  assert.equal(live.cliFullyIdle, false)
+  await adapter.closeLive(live, { idle: true })
+  assert.equal(live.dead, false, 'live session stays registered while in-process subagent runs')
+  assert.equal(adapter.live.has('s1'), true)
+
+  await reportStop(true)
+  assert.equal(live.cliFullyIdle, true)
+  await adapter.closeLive(live, { idle: true })
+  assert.equal(live.dead, true)
+  assert.equal(adapter.live.has('s1'), false)
 })

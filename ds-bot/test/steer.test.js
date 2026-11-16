@@ -445,6 +445,31 @@ test('steer cut: user steer during model phase cancels with hook and moves steer
   await stop()
 })
 
+test('steer cut: steerable local agents (antigravity, codex, claude) bypass hard model cut while non-steerable ACP still cuts', async () => {
+  const { emit, stop, rt, agent, calls } = await start()
+  const dm = 'dm-a'
+  for (const modelRef of ['local-antigravity/gemini-4-carbon', 'local-codex-cli/gpt-5.1-codex', 'local-claude-code/sonnet']) {
+    rt.state.bots.a.model = modelRef
+    await emit(dm, 'turn/start', { turn: 1 })
+    await emit(dm, 'step/start', { turn: 1, step: 1 })
+    const steer = userMessage(`steer-${modelRef}`)
+    agent.inbox.nextStep.push(steer)
+    await emit(dm, 'agent/inbox/spliced', { target: 'next-step', inserted: [steer] })
+    assert.equal(calls.find(c => c[0] === 'cancel'), undefined, `${modelRef} must not cancel active CLI turn on steer`)
+    agent.inbox.nextStep.length = 0
+    await emit(dm, 'turn/end', { reason: { kind: 'completed' } })
+  }
+  // A non-steerable ACP route still uses maybeCut as before.
+  rt.state.bots.a.model = 'local-cursor-cli/default'
+  await emit(dm, 'turn/start', { turn: 2 })
+  await emit(dm, 'step/start', { turn: 2, step: 1 })
+  const steer = userMessage('steer-cursor')
+  agent.inbox.nextStep.push(steer)
+  await emit(dm, 'agent/inbox/spliced', { target: 'next-step', inserted: [steer] })
+  assert.deepEqual(calls.find(c => c[0] === 'cancel')?.[1], { kind: 'hook', reason: STEER_CUT })
+  await stop()
+})
+
 test('steer cut: no cut during tools phase or for a non-Bot session', async () => {
   const { emit, stop, agent, calls } = await start()
   const dm = 'dm-a'

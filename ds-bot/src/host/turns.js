@@ -870,8 +870,10 @@ export function install(rt) {
         setActivity(id, 'thinking')
         entry.turn = event.data.turn
         entry.since = event.time ?? Date.now()
+        entry.folder = rt.sessionFolder?.(session)
         entry.texts = []
         entry.shown = 0
+        entry.stepStreamedTexts = 0
         entry.step = undefined
         entry.info = undefined
         entry.toolCount = 0
@@ -1101,7 +1103,18 @@ export function install(rt) {
         break
       case 'assistant/message': {
         const content = event.data?.message?.content
-        const text = textOf(content)
+        const streamed = entry.stepStreamedTexts ?? 0
+        entry.stepStreamedTexts = 0
+        const fullText = textOf(content)
+        const text = streamed > 0
+          ? (Array.isArray(content) ? content : [])
+            .filter(block => block?.type === 'text' && typeof block.text === 'string')
+            .map(block => block.text.trim())
+            .filter(part => part !== '' && part !== HANDOFF_ACK)
+            .slice(streamed)
+            .join('\n')
+            .trim()
+          : fullText
         const called = Array.isArray(content) && content.some(block => block?.type === 'tool-call')
         const messageUsage = event.data?.usage ?? usageChunk(event.data?.stream)
         if (messageUsage !== undefined) entry.usage = messageUsage
@@ -1110,9 +1123,9 @@ export function install(rt) {
           entry.texts.push(absoluteLinks(text, rt.sessionFolder?.(session)))
           if (entry.turn !== undefined) showSteps(id, entry, called ? entry.texts.length : entry.texts.length - 1)
         }
-        entry.lastText = text
+        entry.lastText = fullText
         entry.lastCalled = called
-        entry.step = called && text !== HANDOFF_ACK ? stripWrittenCalls(text) || undefined : undefined
+        entry.step = called && fullText !== HANDOFF_ACK ? stripWrittenCalls(fullText) || undefined : undefined
         break
       }
       case 'turn/end': {
@@ -1147,6 +1160,8 @@ export function install(rt) {
         entry.info = undefined
         entry.texts = []
         entry.shown = 0
+        entry.stepStreamedTexts = 0
+        entry.folder = undefined
         entry.step = undefined
         entry.toolCount = 0
         entry.suppressedSubagent = false
@@ -1355,6 +1370,26 @@ export function install(rt) {
     if (entry?.turn !== undefined) entry.cut = { texts: entry.texts.length }
   }
 
+  // Local CLI agents run internal tools inside one DSH stream() step: noteCliWork
+  // switches a group round into working state, counts the tool call, and flushes
+  // any closed text blocks emitted ahead of the tool without repeating them later.
+  const noteCliWork = (id, stepTexts = []) => {
+    if (id === undefined || (!rt.isBotSession(id) && !rt.roomOf(id))) return
+    const entry = liveOf(id)
+    entry.toolCount = (entry.toolCount ?? 0) + 1
+    if (rt.groupOwners.has(id)) rt.workRoomTurn?.(id, 'cli')
+    if (entry.turn === undefined || !speaksInGroup(id, entry.info)) return
+    let added = false
+    for (const raw of stepTexts) {
+      const clean = String(raw ?? '').trim()
+      if (clean === '' || clean === HANDOFF_ACK) continue
+      entry.texts.push(absoluteLinks(clean, entry.folder))
+      entry.stepStreamedTexts = (entry.stepStreamedTexts ?? 0) + 1
+      added = true
+    }
+    if (added) showSteps(id, entry, entry.texts.length)
+  }
+
   // DSH's prompt admission wraps any unexpected failure as 'session/agent-busy' and
   // keeps the real cause in details.reason, which the window never shows and the log
   // never saw (#424). For a Session this team owns, the reason is written to the
@@ -1396,5 +1431,5 @@ export function install(rt) {
     }, 'ds-bot: prompt rejection reasons')
   }
 
-  Object.assign(rt, { live, liveOf, roomWaiters, roomProgress, roomInbox, activityView, workView, roomWorkView, turnsView, steeredView, callDetail, doingOf, stopRoomTurn, stopChat, releaseBot, unblockBots, resumeBot, markSteerCut, hasSubagents, stopSubagents, adoptLiveWork })
+  Object.assign(rt, { live, liveOf, roomWaiters, roomProgress, roomInbox, activityView, workView, roomWorkView, turnsView, steeredView, callDetail, doingOf, stopRoomTurn, stopChat, releaseBot, unblockBots, resumeBot, markSteerCut, noteCliWork, hasSubagents, stopSubagents, adoptLiveWork })
 }

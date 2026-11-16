@@ -151,9 +151,9 @@ export function historyEntry(event, group) {
   if (event.type !== 'user/message' || (source?.kind !== 'user' && source?.kind !== SOURCE_KIND)) return undefined
   const text = textOf(event.data.content)
   const ours = source.kind === SOURCE_KIND
-  const skipped = (ours && (source.handoff === true || source.role === 'kickoff' || source.role === 'goal')) || (!group && text.startsWith('[Group chat'))
-  // A turn that went on after a handoff did real work, so its answers stay.
-  return { answer: false, who: ours ? 'bot' : 'user', text: skipped ? '' : text, keepAnswers: !skipped || (ours && source.resume === true) }
+  const skipped = (ours && (source.handoff === true || source.role === 'kickoff' || source.role === 'goal' || source.role === 'background')) || (!group && text.startsWith('[Group chat'))
+  // A turn that went on after a handoff or a background wakeup did real work, so its answers stay.
+  return { answer: false, who: ours ? 'bot' : 'user', text: skipped ? '' : text, keepAnswers: !skipped || (ours && (source.resume === true || source.role === 'background')) }
 }
 
 // A note with every heading in order but some translated (e.g. "## 目标" for "## Goals")

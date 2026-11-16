@@ -712,7 +712,7 @@ export function TriggerCell({ node, sessionId, useRoster, useSessions, useTurnCl
       // Group turns belong to the group chat; the member's own chat stays one-to-one.
       if (source.role === 'kickoff' || source.role === 'room' || source.role === 'goal') return null
       // The secret card itself shows what the user did; the note to the Bot stays out.
-      if (source.role === 'secret' || deferred) return null
+      if (source.role === 'secret' || source.role === 'background' || deferred) return null
       // A profile notice is the user's edit landing in the Bot's chat, not a peer
       // message: show it as an event, with no exchange to open.
       if (source.role === 'update') return h('div', { className: 'bt-event' }, t('Profile updated'))
