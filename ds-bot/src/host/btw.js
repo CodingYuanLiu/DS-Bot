@@ -152,19 +152,25 @@ export function snapshotOf(session, projections) {
 // budget: thinking shares it, so an aside must not set a small one of its own. The
 // messages array is tagged for usage. `extra` messages sit between the snapshot
 // and the prompt; a side chat's earlier finished pairs go there.
-export async function callAside(ctx, rt, snapshot, { extra = [], question, promptFor, kind, retry = false, signal }) {
+export async function callAside(ctx, rt, snapshot, { extra = [], question, promptFor, kind, retry = false, signal, sideSessionId, entryId }) {
+  const isolatedSide = typeof sideSessionId === 'string' && sideSessionId !== ''
   const messages = rt.tagUsage([
     ...snapshot.messages,
     ...extra,
-    { role: 'user', content: [{ type: 'text', text: promptFor(question, retry) }] },
+    {
+      ...(isolatedSide && entryId ? { id: `side-q-${entryId}${retry ? '-retry' : ''}` } : {}),
+      role: 'user',
+      content: [{ type: 'text', text: promptFor(question, retry) }],
+    },
   ], { sessionId: snapshot.sessionId, kind })
-  const tools = snapshot.header?.tools
+  const tools = isolatedSide ? undefined : snapshot.header?.tools
   const callOptions = {
     ...snapshot.header?.config,
     messages,
     toolHistory: snapshot.toolHistory,
     ...(tools ? { tools: [...tools] } : {}),
-    sessionId: snapshot.sessionId,
+    sessionId: isolatedSide ? sideSessionId : snapshot.sessionId,
+    ...(isolatedSide ? { sideMainCount: snapshot.messages.length } : {}),
     signal,
   }
   const assembler = await (rt?.assembleLlm ? rt.assembleLlm(callOptions) : assembleLlmStream(ctx, callOptions, { backoff: rt?.config?.llmRetryBackoff }))

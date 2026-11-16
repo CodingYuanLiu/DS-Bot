@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { hostname, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { createRuntime } from '../index.js'
+import { refreshSearchDirs } from '../src/host/local-agents/discover.js'
 import { SIDE_MARKER } from '../src/host/side.js'
 import { fakeContext } from './fake-ctx.js'
+
+const ACP_FIXTURE = fileURLToPath(new URL('./fixtures/fake-acp.mjs', import.meta.url))
 
 const user = text => ({ role: 'user', content: [{ type: 'text', text }] })
 const assistant = (...blocks) => ({ role: 'assistant', content: blocks })
@@ -643,9 +647,180 @@ test('a side question retries transient TRANSPORT failures and stops immediately
   t.after(() => recovered.stop())
   const asked = await recovered.call('side-ask', { sessionId: 's-now', text: 'quick check' })
   await recovered.rt.sideJoin(asked.value.entryId)
-  const entry = chatOf(recovered.rt, asked.value.chatId).entries[0]
+  const entry = chatOf(recovered.rt, asked.value.entryId ? asked.value.chatId : '')?.entries?.[0] ?? chatOf(recovered.rt, asked.value.chatId).entries[0]
   assert.equal(recovered.requests.length, 2)
   assert.equal(entry.status, 'done')
   assert.equal(entry.answer, 'Clean answer.')
+})
+
+test('local-agent /side runs concurrently in an isolated read-only session without blocking or polluting the main agy session, and closes on side-close', { skip: process.platform === 'win32' }, async (t) => {
+  const tmpRoot = realpathSync(mkdtempSync(join(tmpdir(), 'dsb-side-agy-')))
+  const binDir = join(tmpRoot, 'bin')
+  const fakeHome = join(tmpRoot, 'home')
+  const workDir = join(tmpRoot, 'workspace')
+  const runtimeHome = join(tmpRoot, 'dsh-bot-home')
+  mkdirSync(binDir, { recursive: true })
+  mkdirSync(fakeHome, { recursive: true })
+  mkdirSync(workDir, { recursive: true })
+  mkdirSync(runtimeHome, { recursive: true })
+
+  const agyShim = join(binDir, 'agy')
+  writeFileSync(agyShim, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "agy 0.2.8"; exit 0; fi\nexec "${process.execPath}" "${ACP_FIXTURE}" --agy "$@"\n`, 'utf8')
+  chmodSync(agyShim, 0o755)
+
+  const prevPath = process.env.PATH
+  const prevHome = process.env.HOME
+  process.env.PATH = `${binDir}${delimiter}${prevPath ?? ''}`
+  process.env.HOME = fakeHome
+  await refreshSearchDirs()
+
+  const botState = team({
+    bots: {
+      b1: {
+        id: 'b1',
+        sessionId: 's-now',
+        name: 'Chief',
+        model: 'local-antigravity/default',
+        appliedModel: 'local-antigravity/default',
+        permission: 'danger-full-access',
+        capabilities: [],
+        color: 'deepseek',
+        createdAt: 1,
+      },
+    },
+  })
+  writeFileSync(join(runtimeHome, 'state.json'), JSON.stringify(botState))
+
+  const header = {
+    cwd: workDir,
+    config: { provider: 'local-antigravity', model: 'default' },
+    tools: [{ name: 'message_bot' }, { name: 'pwsh' }],
+  }
+  const mainMessages = [{ id: 'm1', role: 'user', content: [{ type: 'text', text: 'Analyze benchmark logs in detail' }], source: { kind: 'user' } }]
+  const session = makeSession('s-now', { messages: mainMessages, header, seq: 2, toolHistory: [] })
+  const sessions = new Map([[session.id, session]])
+
+  const adapters = new Map()
+  const services = {}
+  const ctx = fakeContext({ services })
+  services.sessionProjections = projectionRegistry(ctx)
+  ctx.llm = {
+    registerAdapter(routes, adapter) {
+      let current = [...routes]
+      for (const r of current) adapters.set(r, adapter)
+      const off = () => { for (const r of current) if (adapters.get(r) === adapter) adapters.delete(r) }
+      off.replace = (next) => { off(); current = [...next]; for (const r of current) adapters.set(r, adapter) }
+      return off
+    },
+    listProviders: () => [...adapters.keys()].map(id => ({ id, name: id })),
+    listModels: async provider => adapters.get(provider)?.listModels(provider) ?? [],
+    resolveModelInfo: async (provider, model) => adapters.get(provider)?.resolveModel(provider, model) ?? { reasoning: { efforts: [] } },
+    async* stream(opts) {
+      const adapter = adapters.get(opts.provider)
+      if (!adapter) throw new Error(`no adapter for ${opts.provider}`)
+      yield* adapter.stream(opts)
+    },
+  }
+  ctx.sessionController = {
+    resolveAgent: async (sessionId) => {
+      const found = sessions.get(sessionId)
+      if (found === undefined) throw new Error(`no session ${sessionId}`)
+      return { agent: { id: sessionId, session: found } }
+    },
+    list: async () => ({ items: [] }),
+    projections: async () => null,
+    page: async () => ({ records: [], hasMore: false }),
+    selectModel: async () => {},
+    prompt: async () => {},
+  }
+  ctx.sessions = { flush: async () => {}, messageProjections: [] }
+  ctx.workspaceRegistry = { archiveSession: async () => {} }
+  ctx.sessionTitle = { rename: async () => {} }
+  let apiRoute
+  const origReg = ctx.connection.fetch.register
+  ctx.connection.fetch.register = (opts) => { apiRoute = opts; return origReg(opts) }
+
+  const rt = createRuntime(ctx, { home: runtimeHome, github: false, diagnosticsFile: false })
+  await rt.load()
+  const callApi = async (endpoint, payload) => {
+    const res = await apiRoute.fetch(new Request('http://localhost/api/bot', { method: 'POST', body: JSON.stringify({ endpoint, payload }) }))
+    return res.json()
+  }
+  await callApi('local-agents', {})
+
+  t.after(async () => {
+    process.env.PATH = prevPath
+    process.env.HOME = prevHome
+    await refreshSearchDirs()
+    await ctx.dispose()
+    rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5 })
+  })
+
+  // 1. Start a long-running main turn on s-now (`danger-full-access` on main chat).
+  const readyFile = join(tmpRoot, 'main.ready')
+  const releaseFile = join(tmpRoot, 'main.release')
+  const collectStream = async (stream) => {
+    let text = ''
+    for await (const chunk of stream) {
+      if (chunk.type === 'text-delta') text += chunk.text
+    }
+    return text
+  }
+  const mainTurnPromise = collectStream(ctx.llm.stream({
+    provider: 'local-antigravity',
+    model: 'default',
+    sessionId: 's-now',
+    messages: [...mainMessages, { id: 'm-slow', role: 'user', content: [{ type: 'text', text: `slow-main:${readyFile}|${releaseFile}` }], source: { kind: 'user' } }],
+    tools: [{ name: 'message_bot' }],
+    signal: AbortSignal.timeout(30_000),
+  }))
+
+  for (let i = 0; i < 200 && !existsSync(readyFile); i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 15))
+  }
+  assert.equal(existsSync(readyFile), true, 'main agy turn is actively in flight')
+  const mainAcpId = readFileSync(readyFile, 'utf8').trim()
+
+  // 2. While the main turn is STILL running, ask Question 1 in /side!
+  let mainSettled = false
+  void mainTurnPromise.then(() => { mainSettled = true })
+
+  const q1 = await callApi('side-ask', { sessionId: 's-now', text: 'side-inspect first check' })
+  assert.equal(q1.ok, true, q1.error?.message)
+  await rt.sideJoin(q1.value.entryId)
+  assert.equal(mainSettled, false, '/side finishes immediately while main agy turn is still running')
+
+  const e1 = chatOf(rt, q1.value.chatId).entries[0]
+  assert.equal(e1.status, 'done', e1.error)
+  assert.match(e1.answer, /mode=default/, 'side session is forced to read-only mode even when Bot is danger-full-access')
+  assert.match(e1.answer, /mcp=no/, 'side session attaches no team MCP server')
+  assert.match(e1.answer, /open=2/, 'multiplexes a second session inside the same agy worker process')
+  assert.match(e1.answer, /readOk=true writeBlocked=true/, 'allows read-only inspection while rejecting mutating permissions')
+  assert.match(e1.answer, new RegExp(`cwd=${workDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+  assert.match(e1.answer, /Analyze benchmark logs in detail/, 'receives the main chat snapshot')
+  assert.doesNotMatch(e1.answer, new RegExp(`session=${mainAcpId}\\b`), 'uses an isolated acpSessionId')
+
+  // 3. Main chat progresses; ask follow-up Question 2 in the SAME Side Chat tab.
+  session.messages.push({ id: 'm2', role: 'assistant', content: [{ type: 'text', text: 'Phase 1 throughput = 420 tok/s' }], source: { kind: 'model', provider: 'local-antigravity', model: 'default' } })
+  const q2 = await callApi('side-ask', { sessionId: 's-now', chatId: q1.value.chatId, text: 'side-inspect follow-up check' })
+  assert.equal(q2.ok, true, q2.error?.message)
+  await rt.sideJoin(q2.value.entryId)
+  const e2 = chatOf(rt, q1.value.chatId).entries[1]
+  assert.equal(e2.status, 'done', e2.error)
+  assert.match(e2.answer, /open=2/, 'reuses the same side ACP session across follow-up questions')
+  assert.match(e2.answer, /Phase 1 throughput = 420 tok\/s/, 'receives incremental main-chat updates')
+  assert.doesNotMatch(e2.answer, /Analyze benchmark logs in detail/, 'does not re-send already-seen main history on warm follow-up')
+
+  // 4. Verify state.json has zero side:* records and main session record is untouched.
+  const persisted = JSON.parse(readFileSync(join(runtimeHome, 'state.json'), 'utf8'))
+  assert.equal(persisted.localAgents?.sessions?.['s-now']?.cliSessionId, mainAcpId)
+  assert.deepEqual(Object.keys(persisted.localAgents?.sessions ?? {}).filter(key => key.startsWith('side:')), [])
+
+  // 5. Close the Side Chat tab -> side ACP session closes immediately (`openSessions=1`), main turn finishes unpolluted!
+  const closed = await callApi('side-close', { chatId: q1.value.chatId })
+  assert.deepEqual(closed, { ok: true, value: {} })
+  writeFileSync(releaseFile, 'go', 'utf8')
+  const mainOut = await mainTurnPromise
+  assert.match(mainOut, new RegExp(`main-done session=${mainAcpId} totalPrompts=1 openSessions=1`))
 })
 

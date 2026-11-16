@@ -81,6 +81,11 @@ export function install(rt) {
   }
 
   const liveAgent = sessionId => ctx.get?.('agents')?.get(sessionId) ?? ctx.agents?.get?.(sessionId)
+  const isSideSession = sessionId => typeof sessionId === 'string' && sessionId.startsWith('side:')
+  // Ephemeral side-chat sessions (`side:<chatId>`) stay purely in memory so they
+  // never pollute `state.localAgents.sessions` or block the Bot's main session.
+  const sideRecords = new Map()
+  const sideOwners = new Map()
 
   const adapter = new LocalAgentAdapter({
     rt,
@@ -88,27 +93,33 @@ export function install(rt) {
     findExecutable,
     spawnEngine,
     usedModels: route => usedRefs().map(ref => splitRef(ref)).filter(used => used?.provider === route).map(used => used.model),
-    record: sessionId => store().sessions[sessionId],
+    record: sessionId => (isSideSession(sessionId) ? sideRecords.get(sessionId) : store().sessions[sessionId]),
     saveRecord: (sessionId, record) => {
+      if (isSideSession(sessionId)) { sideRecords.set(sessionId, record); return }
       store().sessions[sessionId] = record
       void rt.save().catch(() => {})
+    },
+    dropRecord: (sessionId) => {
+      if (isSideSession(sessionId)) sideRecords.delete(sessionId)
     },
     recordUsage: entry => rt.recordUsage?.(entry),
     // A change that rides along with the next save: the CLI reports its context on
     // every model call.
     patchRecord: (sessionId, patch) => {
-      const record = store().sessions[sessionId]
+      const record = isSideSession(sessionId) ? sideRecords.get(sessionId) : store().sessions[sessionId]
       if (record !== undefined) Object.assign(record, patch)
     },
     presetFor: (sessionId) => {
+      if (isSideSession(sessionId)) return 'read-only'
       const bot = rt.botOf(rt.selfOf(sessionId))
       const room = rt.roomOf(rt.groupOwners.get(sessionId)?.roomId)
       return room?.permission ?? bot?.permission ?? 'workspace-write'
     },
     cwdFor: async (sessionId) => {
+      const targetId = sideOwners.get(sessionId) ?? sessionId
       try {
-        const agent = await rt.resolveAgent(sessionId)
-        return agent.session.header?.cwd ?? rt.workDirOf?.({ botId: rt.selfOf(sessionId), roomId: rt.groupOwners.get(sessionId)?.roomId }) ?? rt.teamFolder?.() ?? tmpdir()
+        const agent = await rt.resolveAgent(targetId)
+        return agent.session.header?.cwd ?? rt.workDirOf?.({ botId: rt.selfOf(targetId), roomId: rt.groupOwners.get(targetId)?.roomId }) ?? rt.teamFolder?.() ?? tmpdir()
       } catch {
         return rt.teamFolder?.() ?? tmpdir()
       }
@@ -321,6 +332,15 @@ export function install(rt) {
     localAgentRoutes: allRoutes, localAgentsEndpoint, localAgentModels,
     engineNameOf: ref => (isLocalAgentRef(ref) ? adapter.providerInfo(splitRef(ref).provider).name : `the model ${ref}`),
     closeLocalAgentSession: (sessionId, reason) => adapter.closeSession(sessionId, reason),
+    registerLocalAgentSideSession: (sideSessionId, mainSessionId) => {
+      sideOwners.set(String(sideSessionId), String(mainSessionId))
+    },
+    closeLocalAgentSideSession: async (sideSessionId) => {
+      const id = String(sideSessionId)
+      sideOwners.delete(id)
+      sideRecords.delete(id)
+      await adapter.closeSideSession(id)
+    },
     // The parts module's view of a CLI session's context, and the requests it makes of
     // the CLI when the conversation grows long: condense, write the handoff note, and
     // answer the context steward when the team has no model of its own.

@@ -22,7 +22,7 @@
 // `--cursor-modes` lists the modes cursor-agent 2026.11.05 does (agent, plan, ask)
 // and refuses any other, as it does.
 import { spawn } from 'node:child_process'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { createInterface } from 'node:readline'
 
@@ -194,7 +194,39 @@ async function runPrompt(session, prompt, requestId) {
     }, 20)
     return
   }
-  if (text.includes('count-sessions')) { finish(`sessions: ${sessions.size}`); return }
+  session.prompts = [...(session.prompts ?? []), text]
+  if (text.includes('count-sessions')) { finish(`sessions: ${sessions.size}; seen: ${session.prompts.length}`); return }
+  if (text.includes('slow-main:')) {
+    const [, readyPath, releasePath] = /slow-main:([^|]+)\|([^\s]+)/.exec(text) ?? []
+    if (readyPath) writeFileSync(readyPath, sessionId, 'utf8')
+    while (releasePath && !existsSync(releasePath)) {
+      await new Promise(resolve => setTimeout(resolve, 15))
+    }
+    finish(`main-done session=${sessionId} totalPrompts=${session.prompts.length} openSessions=${sessions.size}`)
+    return
+  }
+  if (text.includes('side-inspect')) {
+    const readPerm = await ask('session/request_permission', {
+      sessionId,
+      toolCall: { toolCallId: 'ro-read', kind: 'read', title: 'Read README' },
+      options: [
+        { optionId: 'allow-read', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'deny-read', name: 'Reject', kind: 'reject_once' },
+      ],
+    })
+    const writePerm = await ask('session/request_permission', {
+      sessionId,
+      toolCall: { toolCallId: 'ro-edit', kind: 'edit', title: 'Edit README' },
+      options: [
+        { optionId: 'allow-write', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'deny-write', name: 'Reject', kind: 'reject_once' },
+      ],
+    })
+    const readOk = readPerm?.result?.outcome?.optionId === 'allow-read'
+    const writeBlocked = writePerm?.result?.outcome?.optionId === 'deny-write'
+    finish(`side session=${sessionId} mode=${session.mode} mcp=${session.mcp ? 'yes' : 'no'} open=${sessions.size} readOk=${readOk} writeBlocked=${writeBlocked} cwd=${process.cwd()} saw=${JSON.stringify(text)}`)
+    return
+  }
   if (/\bhang\b/.test(text)) return // session/cancel releases it below
   if (text.includes('show-state')) { finish(`cwd: ${process.cwd()}; effort: ${session.thoughtLevel ?? 'default'}${legacyModels ? `; model: ${session.model ?? 'default'}` : ''}`); return }
   if (text.includes('show-mode')) { finish(`mode: ${session.mode}; refused: ${refusedModes}`); return }

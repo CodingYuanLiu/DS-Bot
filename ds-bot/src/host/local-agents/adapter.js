@@ -19,6 +19,7 @@ const BG_ACTIVE_SETTLE_MS = 15_000
 const APPROVE_TOOL = 'approve_agent_action'
 
 const isBackgroundWake = message => message?.role === 'user' && message.source?.kind === 'bot' && message.source?.role === 'background'
+const isSideSession = sessionId => typeof sessionId === 'string' && sessionId.startsWith('side:')
 // A CLI that answers its compaction command first and condenses after (Devin) says
 // that it started within this long, or it is taken to have condensed without a word.
 const COMPACT_START_MS = 15_000
@@ -256,6 +257,8 @@ export class LocalAgentAdapter extends LlmAdapter {
       record,
       cliSessionId: record?.cliSessionId,
       handed: record?.handedId,
+      sideMainHandedId: record?.sideMainHandedId,
+      sideMainCount: record?.sideMainCount ?? 0,
       promptHash: record?.promptHash,
       defaultEffort: record?.model === options.model ? record?.defaultEffort : undefined,
       effort: record?.effort,
@@ -334,6 +337,8 @@ export class LocalAgentAdapter extends LlmAdapter {
       cliSessionId: live.cliSessionId,
       cwd: live.cwd,
       handedId: live.handed,
+      ...(live.sideMainHandedId === undefined ? {} : { sideMainHandedId: live.sideMainHandedId }),
+      ...(live.sideMainCount > 0 ? { sideMainCount: live.sideMainCount } : {}),
       promptHash: live.promptHash,
       model: live.model,
       ...(live.defaultEffort === undefined ? {} : { defaultEffort: live.defaultEffort }),
@@ -422,6 +427,12 @@ export class LocalAgentAdapter extends LlmAdapter {
     live.engine.forget?.(live.sessionId)
     live.mcp?.close()
     if (idle) {
+      if (isSideSession(live.sessionId)) {
+        this.deps.dropRecord?.(live.sessionId)
+        if (live.engineSession !== undefined) {
+          await live.engine.closeSession?.(live.engineSession).catch(() => {})
+        }
+      }
       // The CLI session survives on the agent side; the process leaves and the
       // next prompt resumes it.
       live.engineSession = undefined
@@ -460,6 +471,20 @@ export class LocalAgentAdapter extends LlmAdapter {
     if (live === undefined) return
     this.stopTurn(live, reason)
     await this.closeLive(live, { idle: true })
+  }
+
+  // Closing a Side Chat tab releases its isolated read-only CLI session immediately
+  // (`session/close`) without touching the Bot's main CLI session or worker.
+  async closeSideSession(sessionId) {
+    const id = String(sessionId)
+    const live = this.live.get(id)
+    this.deps.dropRecord?.(id)
+    if (live === undefined) return
+    this.stopTurn(live, 'the side chat was closed')
+    if (live.engineSession !== undefined) {
+      await live.engine.closeSession?.(live.engineSession).catch(() => {})
+    }
+    await this.closeLive(live)
   }
 
   // A Claude CLI that died before `system/init` never read the prompt it was
@@ -569,9 +594,10 @@ export class LocalAgentAdapter extends LlmAdapter {
       }
     }
 
+    const sideSession = isSideSession(sessionId)
     const system = messages.filter(message => message.role === 'system').map(message => textOf(message.content)).join('\n').trim()
     const promptHash = system === '' ? undefined : createHash('sha256').update(system).digest('hex')
-    const mcp = await this.ensureMcp(live, () => this.deps.toolsFor(options))
+    const mcp = sideSession ? undefined : await this.ensureMcp(live, () => this.deps.toolsFor(options))
     const cwd = live.cwd ?? await this.deps.cwdFor(sessionId)
     live.cwd = cwd
 
@@ -650,9 +676,33 @@ export class LocalAgentAdapter extends LlmAdapter {
       // already streaming events without an active session/prompt from DSH.
       live.state = 'running'
     } else {
-      let promptBlocks = fresh
+      const mainSlice = sideSession && typeof options.sideMainCount === 'number'
+        ? messages.slice(0, options.sideMainCount)
+        : []
+      let mainReplaced = false
+      let sideMainUpdate = []
+      if (sideSession && !fresh) {
+        if (live.sideMainHandedId !== undefined) {
+          const mainAt = mainSlice.findIndex(message => message.id === live.sideMainHandedId)
+          if (mainAt === -1 && mainSlice.length > 0) mainReplaced = true
+          else if (mainAt !== -1 && mainAt < mainSlice.length - 1) sideMainUpdate = mainSlice.slice(mainAt + 1)
+        } else if (mainSlice.length > live.sideMainCount) {
+          sideMainUpdate = mainSlice.slice(live.sideMainCount)
+        } else if (mainSlice.length < live.sideMainCount) {
+          mainReplaced = true
+        }
+      }
+      let promptBlocks = (fresh || mainReplaced)
         ? await renderReplay(messages, system, resolveImage)
         : (live.spec.kind === 'acp' && remaining.length === 0) ? [] : await renderDelta(contextText, remaining, resolveImage)
+      if (!fresh && !mainReplaced && sideMainUpdate.length > 0) {
+        const updateBlocks = await renderSideMainUpdate(sideMainUpdate, resolveImage)
+        promptBlocks = mergeTextBlocks([...updateBlocks, ...promptBlocks])
+      }
+      if (sideSession) {
+        live.sideMainCount = mainSlice.length
+        live.sideMainHandedId = mainSlice.at(-1)?.id
+      }
       let sentInstructions = live.spec.kind !== 'acp' && freshCli && instructions !== undefined
       // A new CLI session gets its instructions in the open args or the replay;
       // the "updated" line is only for a session that saw older ones.
@@ -1026,6 +1076,10 @@ export class LocalAgentAdapter extends LlmAdapter {
           return
         }
         case 'permission': {
+          if (isSideSession(live.sessionId)) {
+            event.reply(event.changes === true ? (optionOf(event.options, 'reject') ?? null) : (optionOf(event.options, 'allow') ?? null))
+            break
+          }
           // The preset answers what it already decides, also on an agent with no
           // matching mode of its own: full access allows, read-only refuses a change.
           const answer = presetAnswer(this.deps.presetFor(live.sessionId), event)
@@ -1390,6 +1444,19 @@ async function renderDelta(contextText, remaining, resolveImage) {
     parts.push(...await blocksOfMessage(message, { resolveImage }))
   }
   return mergeTextBlocks(parts)
+}
+
+async function renderSideMainUpdate(messages, resolveImage) {
+  const picked = []
+  for (const message of messages) {
+    if (message.role === 'system' || isBackgroundWake(message)) continue
+    const prefix = `${message.role === 'assistant' ? 'You' : message.role === 'tool' ? `Tool result (${message.toolCallId ?? 'call'})` : 'User'}:`
+    const blocks = await blocksOfMessage(message, { maxText: 2_000, resolveImage })
+    if (blocks.length > 0 && blocks[0].type === 'text') picked.push({ type: 'text', text: `${prefix} ${blocks[0].text}` }, ...blocks.slice(1))
+    else if (blocks.length > 0) picked.push({ type: 'text', text: prefix }, ...blocks)
+  }
+  if (picked.length === 0) return []
+  return mergeTextBlocks([{ type: 'text', text: 'New progress in the main conversation since your last side answer (oldest first):' }, ...picked])
 }
 
 // The replay a fresh CLI session stands up on: the system prompt, then the

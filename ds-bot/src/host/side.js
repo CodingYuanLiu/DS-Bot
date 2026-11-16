@@ -21,6 +21,11 @@ const SIDE_PROMPT = [
   'If the answer needs information that is not in the conversation, say so.',
   'Never claim to have done anything.',
 ].join('\n')
+const LOCAL_SIDE_PROMPT = [
+  SIDE_MARKER,
+  'Answer from the conversation so far, based on progress up to this snapshot, and from this side chat.',
+  'This is an isolated read-only side chat: you may inspect or search files read-only when helpful, but never modify files, run mutating commands, or claim to have changed anything.',
+].join('\n')
 const SIDE_RETRY = 'Do not call any tool. Answer in text only.'
 const GROUP_REFUSAL = "Side chat is only available in a Bot's private chat."
 const BUSY_ERROR = 'Wait for the answer, or cancel it.'
@@ -28,15 +33,16 @@ const CHAT_ERROR = 'This side chat is no longer here.'
 const ENTRY_ERROR = 'This side question is no longer here.'
 
 const promptFor = (question, retry) => [SIDE_PROMPT, ...(retry ? [SIDE_RETRY] : []), question].join('\n\n')
+const localPromptFor = (question, retry) => [LOCAL_SIDE_PROMPT, ...(retry ? [SIDE_RETRY] : []), question].join('\n\n')
 
 // Earlier finished pairs sit between the snapshot and the new question. The
 // assistant pair carries the route tag a model-produced message needs — the
 // assembler reads `source` on every assistant message.
-const pairsOf = (chat, entry, route) =>
+const pairsOf = (chat, entry, route, withIds = false) =>
   (chat.entries ?? []).filter(other => other !== entry && other?.status === 'done')
     .flatMap(other => [
-      { role: 'user', content: [{ type: 'text', text: other.question }] },
-      { role: 'assistant', content: [{ type: 'text', text: other.answer }], source: { kind: 'model', provider: route?.provider, model: route?.model } },
+      { ...(withIds ? { id: `side-q-${other.id}` } : {}), role: 'user', content: [{ type: 'text', text: other.question }] },
+      { ...(withIds ? { id: `side-a-${other.id}` } : {}), role: 'assistant', content: [{ type: 'text', text: other.answer }], source: { kind: 'model', provider: route?.provider, model: route?.model } },
     ])
 
 const answering = chat => (chat?.entries ?? []).some(entry => entry?.status === 'answering')
@@ -221,11 +227,23 @@ export function install(rt) {
   }
 
   async function complete(botId, chat, entry, snapshot, signal) {
-    const extra = pairsOf(chat, entry, snapshot.header?.config)
+    const localSide = rt.isLocalAgentRoute?.(snapshot.header?.config?.provider ?? '') === true
+    const sideSessionId = localSide ? `side:${chat.id}` : undefined
+    if (sideSessionId !== undefined) rt.registerLocalAgentSideSession?.(sideSessionId, snapshot.sessionId)
+    const extra = pairsOf(chat, entry, snapshot.header?.config, localSide)
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         if (signal.aborted || entry.status !== 'answering' || !alive(botId, chat, entry)) return
-        const result = await callAside(ctx, rt, snapshot, { extra, question: entry.question, promptFor, kind: 'side', retry: attempt === 1, signal })
+        const result = await callAside(ctx, rt, snapshot, {
+          extra,
+          question: entry.question,
+          promptFor: localSide ? localPromptFor : promptFor,
+          kind: 'side',
+          retry: attempt === 1,
+          signal,
+          sideSessionId,
+          entryId: entry.id,
+        })
         if (signal.aborted || entry.status !== 'answering' || !alive(botId, chat, entry)) return
         if (result.failed !== undefined) {
           // Cancel already left this entry, and the check above returned. A provider
@@ -360,6 +378,7 @@ export function install(rt) {
       const ids = (chat.entries ?? []).filter(entry => entry?.status === 'answering').map(entry => entry.id)
       for (const id of ids) flights.get(id)?.controller.abort()
       await drain(ids)
+      await rt.closeLocalAgentSideSession?.(`side:${chatId}`)
       const current = chats.get(botId)
       if (current !== undefined && current.includes(chat)) {
         chats.set(botId, current.filter(item => item !== chat))
@@ -382,11 +401,13 @@ export function install(rt) {
   // would otherwise finish into the deleted team.
   async function dropBot(botId) {
     dropped.add(botId)
+    const existing = chats.get(botId) ?? []
     chats.delete(botId)
     reading.delete(botId)
     const ids = [...(byBot.get(botId) ?? [])]
     for (const id of ids) flights.get(id)?.controller.abort()
     await drain(ids)
+    await Promise.all(existing.map(chat => rt.closeLocalAgentSideSession?.(`side:${chat.id}`)))
     if (sideDir !== undefined && writes()) await rm(botFile(botId), { force: true }).catch(error => rt.warn('ds-bot: side chats of %s not removed: %s', botId, error))
   }
 

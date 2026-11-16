@@ -153,7 +153,7 @@ export class AcpEngine {
     const spawnCwd = this.engine.spawnCwd && existsSync(this.engine.spawnCwd) ? this.engine.spawnCwd : undefined
     const child = spawnAgent(bin, this.engine.args ?? [], {
       ...(spawnCwd !== undefined ? { cwd: spawnCwd } : {}),
-      env: cleanEnv({ ...(this.engine.env ?? {}), ...steerEnv }),
+      env: cleanEnv({ ...this.engine.env, ...steerEnv }),
       stdio: ['pipe', 'pipe', 'inherit'],
       windowsHide: true,
     })
@@ -554,7 +554,7 @@ export class AcpEngine {
       await worker.closeSession(session)
       worker.forget(session.dshSessionId)
       this.sessionWorkers.delete(session.dshSessionId)
-      if (worker.ephemeral && worker.sessions.size === 0) {
+      if (worker.sessions.size === 0) {
         for (const [key, entry] of this.workers) if (entry === worker) this.workers.delete(key)
         await worker.close()
       }
