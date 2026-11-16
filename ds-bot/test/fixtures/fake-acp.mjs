@@ -173,6 +173,9 @@ async function runPrompt(session, prompt, requestId) {
   }
   const text = blocks.filter(block => block.type === 'text').map(block => block.text ?? '').join('\n')
   const sessionId = session.id
+  if (Array.isArray(session.catchupReplay) && session.catchupReplay.length > 0) {
+    for (const notice of session.catchupReplay.splice(0)) update(sessionId, notice)
+  }
   const finish = (textOut) => {
     update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: textOut } })
     if (!reportsUsage) { reply(requestId, { stopReason: 'end_turn' }); return }
@@ -436,6 +439,12 @@ async function runPrompt(session, prompt, requestId) {
       })
       writeFileSync(transcriptPath, `${turn1Lines}${wakeStep}\n${compactReply}\n`, 'utf8')
       writeFileSync(fullPath, `${turn1Lines}${wakeStep}\n${fullReply}\n`, 'utf8')
+      session.catchupReplay = [
+        { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Synthesizing subagent findings' } },
+        { sessionUpdate: 'tool_call', toolCallId: 'bg-catchup-1', kind: 'execute', title: 'Run manage_subagents', status: 'in_progress' },
+        { sessionUpdate: 'tool_call_update', toolCallId: 'bg-catchup-1', status: 'completed' },
+        { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Full subagent report from transcript_full.jsonl!' } },
+      ]
       await callSteerHook({ conversationId: sessionId, hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL', fullyIdle: true, transcriptPath })
     }, 35)
     return

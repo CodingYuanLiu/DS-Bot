@@ -305,10 +305,21 @@ test('antigravity Stop hook + transcriptPath delivers idle subagent wakeup witho
   send(agent, `transcript-bg-wakeup:${logDir}`)
   await secondTurnDone
 
-  const assistantTexts = agent.session.snapshotEvents()
+  const assistantTexts = () => agent.session.snapshotEvents()
     .filter(event => event.type === 'assistant/message')
     .map(event => (event.data?.message?.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('\n'))
-  assert.equal(assistantTexts.length, 2)
-  assert.equal(assistantTexts[0], 'Subagent dispatched in Turn 1.')
-  assert.equal(assistantTexts[1], 'Full subagent report from transcript_full.jsonl!')
+  assert.equal(assistantTexts().length, 2)
+  assert.equal(assistantTexts()[0], 'Subagent dispatched in Turn 1.')
+  assert.equal(assistantTexts()[1], 'Full subagent report from transcript_full.jsonl!')
+
+  // Next session/prompt replays the idle background steps on stdout before answering:
+  // the adapter must strip that catch-up replay so Turn 2's report is never duplicated!
+  const thirdTurnDone = waitForIdle(ctx, agent)
+  send(agent, 'next user question')
+  await thirdTurnDone
+  assert.deepEqual(assistantTexts(), [
+    'Subagent dispatched in Turn 1.',
+    'Full subagent report from transcript_full.jsonl!',
+    'ok: next user question',
+  ])
 })

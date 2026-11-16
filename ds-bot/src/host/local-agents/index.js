@@ -155,15 +155,32 @@ export function install(rt) {
       if (isSideSession(sessionId)) return (await rt.onSideBackgroundWake?.(sessionId)) === true
       const agent = await rt.resolveAgent(sessionId).catch(() => undefined)
       if (typeof agent?.followup !== 'function') return false
+      let pendingWork = rt.activeCliBackgroundWork?.(sessionId)?.parent
+      if (pendingWork === undefined) {
+        const runningWork = rt.runningWorkOfSession?.(sessionId)
+        const bgGen = adapter.cliBackgroundState(sessionId).gen
+        if (runningWork !== undefined && rt.holdCliBackgroundWork?.(sessionId, runningWork, bgGen) !== undefined) {
+          pendingWork = runningWork
+        }
+      }
       const already = (agent.inbox?.nextTurn ?? []).some(msg => msg?.source?.kind === SOURCE_KIND && msg.source.role === 'background')
       if (!already) {
         agent.followup(createUserMessage({
           content: [{ type: 'text', text: '[Background update]' }],
-          source: { kind: SOURCE_KIND, form: 'relay', role: 'background' },
+          source: {
+            kind: SOURCE_KIND,
+            form: 'relay',
+            role: 'background',
+            ...(pendingWork ? { work: pendingWork } : {}),
+          },
         }))
       }
       await ctx.sessions.flush(agent.session)
       return true
+    },
+    onBackgroundLost: (sessionId, error) => {
+      if (isSideSession(sessionId)) return
+      rt.onCliBackgroundLost?.(sessionId, error)
     },
     onBackgroundSettled: async (sessionId) => {
       if (isSideSession(sessionId)) return
@@ -348,6 +365,11 @@ export function install(rt) {
     registerLocalAgentSideSession: (sideSessionId, mainSessionId) => {
       sideOwners.set(String(sideSessionId), String(mainSessionId))
     },
+    isLocalAgentBackgroundBusy: sessionId => adapter.isSessionBackgroundBusy(String(sessionId)),
+    localAgentCliBackgroundState: sessionId => adapter.cliBackgroundState(String(sessionId)),
+    clearLocalAgentCliBackgroundLost: sessionId => adapter.clearCliBackgroundLost(String(sessionId)),
+    localAgentBusySessions: () => adapter.busySessionIds(),
+    cancelLocalAgentTurn: (sessionId, reason) => adapter.cancelSessionTurn(String(sessionId), reason),
     isLocalAgentSideBusy: sideSessionId => adapter.isSideSessionBusy(String(sideSessionId)),
     hasLocalAgentSideBackground: sideSessionId => adapter.hasSideSessionBackground(String(sideSessionId)),
     cancelLocalAgentSideTurn: (sideSessionId, reason) => adapter.cancelSideTurn(String(sideSessionId), reason),

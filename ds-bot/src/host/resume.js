@@ -462,14 +462,25 @@ export function install(rt) {
     }
     // What a group's members were asked for and will not pick up is settled now.
     await rt.settleRoomBatches?.()
+    await rt.reconcileLostCliWorks?.()
   }
 
   ctx.effect(() => {
     const pending = Object.keys(interrupted.turns).length > 0 || Object.keys(interrupted.queued).length > 0
-    // With nothing to pick up, the group batches a restart left are settled at once.
+    const delayMs = rt.config?.resumeDelayMs ?? RESUME_DELAY_MS
+    // With nothing to pick up, the group batches a restart left are settled at once;
+    // any persisted local-CLI background subagent waits reconcile after workspaces open.
     const timer = pending
-      ? setTimeout(() => void resumeAll().catch(error => rt.warn('ds-bot: picking up interrupted work failed: %s', error)), RESUME_DELAY_MS)
-      : setTimeout(() => void rt.load().then(() => rt.settleRoomBatches?.()).catch(error => rt.warn('ds-bot: settling group batches failed: %s', error)), 0)
+      ? setTimeout(() => void resumeAll().catch(error => rt.warn('ds-bot: picking up interrupted work failed: %s', error)), delayMs)
+      : setTimeout(() => void rt.load().then(async () => {
+        await rt.settleRoomBatches?.()
+        if (rt.hasPersistedCliBackgroundWorks?.()) {
+          const cliTimer = setTimeout(() => {
+            void rt.reconcileLostCliWorks?.().catch(error => rt.warn('ds-bot: interrupted CLI subagent waits not settled: %s', error))
+          }, delayMs)
+          cliTimer.unref?.()
+        }
+      }).catch(error => rt.warn('ds-bot: settling group batches failed: %s', error)), 0)
     timer?.unref?.()
     // What the turns stopped by this shutdown left stays as last noted.
     return () => {

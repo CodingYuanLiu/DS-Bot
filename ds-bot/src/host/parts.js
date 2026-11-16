@@ -1527,7 +1527,7 @@ export function install(rt) {
       engineRetry.delete(sessionId)
       try {
         const agent = await rt.resolveAgent(sessionId)
-        if (agent.status === 'idle' && engineMoved(agent, placeOf(sessionId))) startSwitch(agent, { engine: true })
+        if (agent.status === 'idle' && rt.isLocalAgentBackgroundBusy?.(sessionId) !== true && engineMoved(agent, placeOf(sessionId))) startSwitch(agent, { engine: true })
       } catch (error) {
         rt.warn('ds-bot: %s did not follow its run mode in %s: %s', rt.botOf(botId)?.name ?? botId, sessionId, error)
       }
@@ -1602,6 +1602,7 @@ export function install(rt) {
   // steward decides as well, so the part moves on at a stopping point instead of being
   // condensed again and again; the compactions so far make a fresh part likelier.
   async function checkLocal(agent) {
+    if (rt.isLocalAgentBackgroundBusy?.(agent.id) === true) return
     const context = rt.localAgentContext?.(agent.id)
     const lines = await contextLines(agent.session).catch(() => undefined)
     if (context === undefined || lines === undefined) return
@@ -2019,7 +2020,7 @@ export function install(rt) {
     const agent = await rt.resolveAgent(sessionId)
     const place = placeOf(sessionId)
     if (place?.botId === undefined || place.roomId !== undefined) throw Object.assign(new Error('Only a Bot\'s own chat can start a fresh part'), { code: 'bot/invalid' })
-    if (agent.status === 'idle') {
+    if (agent.status === 'idle' && rt.isLocalAgentBackgroundBusy?.(sessionId) !== true) {
       startSwitch(agent, { manual: true })
       return true
     }

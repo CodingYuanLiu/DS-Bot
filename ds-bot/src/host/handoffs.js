@@ -109,9 +109,9 @@ export function install(rt) {
   // child, is the sub-work, so a child that is continued hands up a result per run.
   // `fromPart`: the part of the sender's own chat it wrote from, which its answer goes
   // back to when that is a background part.
-  function openWork(id, { from, to, parent, fromRoom, room, name, child, fromPart }) {
+  function openWork(id, { from, to, parent, fromRoom, room, name, child, cliSession, cliGen, fromPart }) {
     const above = parent === undefined ? undefined : works()[parent]
-    works()[id] = { ...(from ? { from } : {}), ...(to ? { to } : {}), ...(room ? { room } : {}), ...(above ? { parent } : {}), ...(fromRoom ? { fromRoom } : {}), ...(fromPart ? { fromPart } : {}), ...(name ? { name } : {}), ...(child ? { child } : {}), open: [], results: [], at: Date.now() }
+    works()[id] = { ...(from ? { from } : {}), ...(to ? { to } : {}), ...(room ? { room } : {}), ...(above ? { parent } : {}), ...(fromRoom ? { fromRoom } : {}), ...(fromPart ? { fromPart } : {}), ...(name ? { name } : {}), ...(child ? { child } : {}), ...(cliSession ? { cliSession } : {}), ...(typeof cliGen === 'number' ? { cliGen } : {}), open: [], results: [], at: Date.now() }
     if (above !== undefined) above.open.push(id)
     save()
   }
@@ -331,6 +331,8 @@ export function install(rt) {
     ? `the group chat "${rt.roomOf(work.room)?.name ?? 'a group chat'}"`
     : nameOf(work.to) ?? work.name ?? 'the other Bot')
 
+  const abandonedCliRuns = new Map()
+
   // Giving up one wait: the sub-work closes with an explicit result that says no reply
   // came back, so the work above it goes on. Only this branch settles; the parent's
   // other open works stay. `gone` is the startup sweep, whose target no longer exists.
@@ -338,6 +340,9 @@ export function install(rt) {
     const work = works()[id]
     const parent = work?.parent === undefined ? undefined : works()[work.parent]
     if (work === undefined || parent === undefined || !parent.open.includes(id)) return false
+    if (typeof work.cliSession === 'string') {
+      abandonedCliRuns.set(work.cliSession, { id, gen: work.cliGen ?? 0 })
+    }
     const target = labelOfWork(work)
     const name = rt.botOf(work.to)?.name ?? work.name ?? (work.room !== undefined ? rt.roomOf(work.room)?.name : undefined) ?? 'the other Bot'
     const text = reason === 'gone'
@@ -379,6 +384,109 @@ export function install(rt) {
       if (gone) abandonWork(id, 'gone')
     }
   }
+
+  function activeCliBackgroundWork(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return undefined
+    for (const [id, work] of Object.entries(works())) {
+      if (work.cliSession !== sessionId || work.parent === undefined) continue
+      const parent = works()[work.parent]
+      if (parent === undefined || !parent.open.includes(id)) continue
+      return { id, parent: work.parent, since: work.at ?? Date.now(), gen: work.cliGen ?? 0 }
+    }
+    return undefined
+  }
+
+  function isAbandonedCliRun(sessionId, cliGen = 0) {
+    const entry = abandonedCliRuns.get(sessionId)
+    return entry !== undefined && entry.gen === cliGen
+  }
+
+  function consumeAbandonedCliRun(sessionId, cliGen = 0) {
+    const entry = abandonedCliRuns.get(sessionId)
+    if (entry === undefined || (cliGen !== 0 && entry.gen !== cliGen)) return undefined
+    abandonedCliRuns.delete(sessionId)
+    takeAbandoned(entry.id)
+    return entry
+  }
+
+  function holdCliBackgroundWork(sessionId, parentWorkId, cliGen = 0) {
+    if (typeof sessionId !== 'string' || sessionId === '' || parentWorkId === undefined) return undefined
+    if (isAbandonedCliRun(sessionId, cliGen)) return undefined
+    const parent = works()[parentWorkId]
+    if (parent === undefined) return undefined
+    const existing = activeCliBackgroundWork(sessionId)
+    if (existing !== undefined) {
+      // Never let a later unrelated request steal an already-held CLI subagent wait.
+      return existing.parent === parentWorkId ? existing.id : undefined
+    }
+    const id = `cli-bg:${randomUUID()}`
+    openWork(id, { from: parent.to, parent: parentWorkId, name: 'background subagent', cliSession: sessionId, cliGen })
+    return id
+  }
+
+  function releaseCliBackgroundWork(sessionId, expectedParentWorkId) {
+    const active = activeCliBackgroundWork(sessionId)
+    if (active === undefined) return undefined
+    if (expectedParentWorkId !== undefined && active.parent !== expectedParentWorkId) return undefined
+    dropWork(active.id)
+    return active
+  }
+
+  function resumeCliBackgroundWork(sessionId, text, { resumed = false, expectedParent } = {}) {
+    const active = releaseCliBackgroundWork(sessionId, expectedParent)
+    if (active === undefined) return false
+    const parent = works()[active.parent]
+    if (parent?.to === undefined || rt.botOf(parent.to) === undefined) return false
+    void rt.deliver({
+      fromName: 'background subagent',
+      toId: parent.to,
+      sessionId,
+      text,
+      role: 'reply',
+      replyTo: active.id,
+      exchangeId: randomUUID(),
+      work: active.parent,
+      ...(resumed ? { resumed: true } : {}),
+      recordExchange: false,
+    }).catch(error => rt.warn('ds-bot: resuming background subagent work for %s failed: %s', parent.to, error))
+    return true
+  }
+
+  function onCliBackgroundLost(sessionId, error) {
+    const detail = typeof error?.message === 'string' && error.message.trim() !== '' ? error.message.trim() : 'CLI exited'
+    return resumeCliBackgroundWork(sessionId, `Your background subagent stopped unexpectedly (${detail}) before handing back a result. Check what is already done and finish the work you were given.`)
+  }
+
+  function onCliBackgroundSettledDuringOtherTurn(sessionId) {
+    return resumeCliBackgroundWork(sessionId, 'Your background subagent finished while you were answering another message. Summarize its findings now as your reply.')
+  }
+
+  async function reconcileLostCliWorks() {
+    if (rt.readOnly?.() !== undefined) return
+    for (const [id, work] of Object.entries(works())) {
+      if (typeof work.cliSession !== 'string' || work.parent === undefined) continue
+      const parent = works()[work.parent]
+      if (parent === undefined || !parent.open.includes(id)) continue
+      if (rt.isLocalAgentBackgroundBusy?.(work.cliSession) === true) continue
+      const targetWork = work.parent
+      const alreadyRunning = rt.runningWorkOfSession?.(work.cliSession) === targetWork
+      const alreadyUnread = (rt.unreadOf?.(work.cliSession) ?? [])
+        .some(args => args?.work === targetWork || args?.exchangeId === targetWork)
+      const agent = await rt.resolveAgent?.(work.cliSession).catch(() => undefined)
+      const alreadyInbox = [...(agent?.inbox?.nextStep ?? []), ...(agent?.inbox?.nextTurn ?? [])]
+        .some(msg => msg?.source?.work === targetWork || msg?.source?.exchangeId === targetWork)
+      if (alreadyRunning || alreadyUnread || alreadyInbox) {
+        dropWork(id)
+        continue
+      }
+      resumeCliBackgroundWork(work.cliSession, 'DeepSeek Harness restarted while your background subagent was running, so it stopped before handing back a result. Check what is already done and finish the work you were given.', { resumed: true, expectedParent: targetWork })
+    }
+  }
+
+  function hasPersistedCliBackgroundWorks() {
+    return Object.values(works()).some(work => typeof work?.cliSession === 'string' && work.parent !== undefined && works()[work.parent]?.open?.includes !== undefined)
+  }
+
   // A host without a context (the narrow tests) has no startup to reconcile. The sweep
   // waits a tick: the team file loads through every module's own setup, and this module
   // is installed before the ones that load it.
@@ -450,5 +558,5 @@ export function install(rt) {
     return lines.join('; ')
   }
 
-  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, lateWork, answerMissed, ownsWork: owns, waitsWork: waits, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView, settleSubWork, subWorkRun, nameSubWork, abandonWork, abandonedWork: takeAbandoned })
+  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, lateWork, answerMissed, ownsWork: owns, waitsWork: waits, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView, settleSubWork, subWorkRun, nameSubWork, abandonWork, abandonedWork: takeAbandoned, activeCliBackgroundWork, holdCliBackgroundWork, releaseCliBackgroundWork, consumeAbandonedCliRun, onCliBackgroundLost, onCliBackgroundSettledDuringOtherTurn, reconcileLostCliWorks, hasPersistedCliBackgroundWorks })
 }

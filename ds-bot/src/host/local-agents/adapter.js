@@ -28,6 +28,69 @@ const resetBgStdout = (live) => {
   live.bgStdoutThoughtChars = 0
   live.bgStdoutActivities = 0
 }
+
+// `agy acp` maintains a per-session stdout cursor across `session/prompt` calls.
+// When an idle background wakeup was already delivered via `Stop` + `transcriptPath`,
+// the next `session/prompt` replays those un-streamed steps over stdout in its first
+// ~50ms before invoking the model; strip that catch-up replay once so it never posts twice.
+function consumeBgReplay(live, event) {
+  const filter = live.replayFilter
+  if (filter === undefined) return event
+  if (Date.now() > filter.deadline) {
+    live.replayFilter = undefined
+    return event
+  }
+  const doneIfEmpty = () => {
+    if (filter.textRem === '' && filter.thinkRem === '' && filter.toolsRem <= 0) {
+      live.replayFilter = undefined
+    }
+  }
+  if (event?.type === 'context' || event?.type === 'usage' || event?.type === 'effort') return event
+  if (event?.type === 'touch') return null
+  if (event?.type === 'activity') {
+    if (filter.toolsRem > 0) {
+      filter.toolsRem -= 1
+      doneIfEmpty()
+      return null
+    }
+    live.replayFilter = undefined
+    return event
+  }
+  if (event?.type === 'thought' && typeof event.text === 'string') {
+    if (filter.thinkRem !== '') {
+      if (filter.thinkRem.startsWith(event.text)) {
+        filter.thinkRem = filter.thinkRem.slice(event.text.length)
+        doneIfEmpty()
+        return null
+      }
+      if (event.text.startsWith(filter.thinkRem)) {
+        const rest = event.text.slice(filter.thinkRem.length)
+        live.replayFilter = undefined
+        return rest === '' ? null : { ...event, text: rest }
+      }
+    }
+    live.replayFilter = undefined
+    return event
+  }
+  if (event?.type === 'text' && typeof event.text === 'string') {
+    if (filter.textRem !== '') {
+      if (filter.textRem.startsWith(event.text)) {
+        filter.textRem = filter.textRem.slice(event.text.length)
+        doneIfEmpty()
+        return null
+      }
+      if (event.text.startsWith(filter.textRem)) {
+        const rest = event.text.slice(filter.textRem.length)
+        live.replayFilter = undefined
+        return rest === '' ? null : { ...event, text: rest }
+      }
+    }
+    live.replayFilter = undefined
+    return event
+  }
+  live.replayFilter = undefined
+  return event
+}
 // A CLI that answers its compaction command first and condenses after (Devin) says
 // that it started within this long, or it is taken to have condensed without a word.
 const COMPACT_START_MS = 15_000
@@ -115,6 +178,7 @@ export class LocalAgentAdapter extends LlmAdapter {
   drainHookSteer(route, cliSessionId) {
     const live = this.liveByCliSession(route, cliSessionId)
     if (live === undefined) return []
+    live.replayFilter = undefined
     const items = live.steerQueue.splice(0)
     if (live.state === 'running' && !isSideSession(live.sessionId)) {
       const inboxItems = this.deps.peekInboxSteers?.(live.sessionId, live.steeredIds) ?? []
@@ -143,7 +207,13 @@ export class LocalAgentAdapter extends LlmAdapter {
   async noteHookStopState(route, cliSessionId, fullyIdle, transcriptPath, terminationReason) {
     const live = this.liveByCliSession(route, cliSessionId)
     if (live === undefined || live.dead) return
-    if (typeof fullyIdle === 'boolean') live.cliFullyIdle = fullyIdle
+    if (typeof fullyIdle === 'boolean') {
+      if (fullyIdle === false && live.cliFullyIdle !== false) {
+        live.cliBgGen = (live.cliBgGen ?? 0) + 1
+        live.cliBgLostError = undefined
+      }
+      live.cliFullyIdle = fullyIdle
+    }
     const cancelled = terminationReason === 'USER_CANCELED' || live.cancellingTurn === true
     if (cancelled) {
       if (fullyIdle !== false) live.cancellingTurn = false
@@ -206,6 +276,9 @@ export class LocalAgentAdapter extends LlmAdapter {
           pushedAny = true
         }
       }
+    }
+    if (pushedAny && Array.isArray(wakeup.replaySteps) && wakeup.replaySteps.length > 0) {
+      live.bgReplayQueue.push(...wakeup.replaySteps)
     }
     if (pushedAny || live.background === true) {
       live.push({ type: 'done', reason: 'end_turn' })
@@ -379,9 +452,13 @@ export class LocalAgentAdapter extends LlmAdapter {
       bgStdoutText: '',
       bgStdoutThoughtChars: 0,
       bgStdoutActivities: 0,
+      bgReplayQueue: [],
+      replayFilter: undefined,
       cancellingTurn: false,
       transcriptWatermark: undefined,
       cliFullyIdle: true,
+      cliBgGen: 0,
+      cliBgLostError: undefined,
       // Prompts queued while a turn runs (ACP speaks one prompt at a time);
       // the drain sends the next one when the turn ends.
       queue: [],
@@ -408,6 +485,7 @@ export class LocalAgentAdapter extends LlmAdapter {
       if (event?.type === 'touch' && live.state === 'idle' && !live.background) return
       if (live.state === 'idle' && !live.background
         && (event?.type === 'text' || event?.type === 'thought' || event?.type === 'activity' || event?.type === 'call' || event?.type === 'permission')) {
+        if (live.cliBgGen === 0) live.cliBgGen = 1
         live.background = true
         this.wakeBackground(live)
       }
@@ -561,7 +639,9 @@ export class LocalAgentAdapter extends LlmAdapter {
     live.bgAbort = undefined
     live.background = false
     resetBgStdout(live)
+    live.replayFilter = undefined
     live.cliFullyIdle = true
+    live.cliBgLostError = undefined
     live.state = 'idle'
     live.queue.length = 0
     live.steerQueue.length = 0
@@ -600,10 +680,39 @@ export class LocalAgentAdapter extends LlmAdapter {
     await this.closeLive(live)
   }
 
-  isSideSessionBusy(sessionId) {
+  isSessionBackgroundBusy(sessionId) {
     const live = this.live.get(String(sessionId))
     return live !== undefined && !live.dead && live.engineSession?.dead !== true
       && (live.cliFullyIdle === false || live.background === true)
+  }
+
+  cliBackgroundState(sessionId) {
+    const live = this.live.get(String(sessionId))
+    if (live === undefined || live.dead) return { busy: false, gen: 0, lostError: undefined }
+    return {
+      busy: this.isSessionBackgroundBusy(sessionId),
+      gen: live.cliBgGen ?? 0,
+      lostError: live.cliBgLostError,
+    }
+  }
+
+  clearCliBackgroundLost(sessionId) {
+    const live = this.live.get(String(sessionId))
+    const err = live?.cliBgLostError
+    if (live !== undefined) live.cliBgLostError = undefined
+    return err
+  }
+
+  busySessionIds() {
+    const ids = []
+    for (const id of this.live.keys()) {
+      if (!isSideSession(id) && this.isSessionBackgroundBusy(id)) ids.push(id)
+    }
+    return ids
+  }
+
+  isSideSessionBusy(sessionId) {
+    return this.isSessionBackgroundBusy(sessionId)
   }
 
   hasSideSessionBackground(sessionId) {
@@ -611,10 +720,14 @@ export class LocalAgentAdapter extends LlmAdapter {
     return live !== undefined && !live.dead && live.engineSession?.dead !== true && live.background === true
   }
 
-  cancelSideTurn(sessionId, reason = 'the side question was cancelled') {
+  cancelSessionTurn(sessionId, reason = 'the turn was stopped') {
     const live = this.live.get(String(sessionId))
     if (live === undefined || live.dead) return
     this.stopTurn(live, reason)
+  }
+
+  cancelSideTurn(sessionId, reason = 'the side question was cancelled') {
+    this.cancelSessionTurn(sessionId, reason)
   }
 
   // A Claude CLI that died before `system/init` never read the prompt it was
@@ -777,12 +890,25 @@ export class LocalAgentAdapter extends LlmAdapter {
       const token = live.pumpToken = {}
       void (async () => {
         while (live.pumpToken === token && !live.dead) {
-          const event = await session.next()
+          let event = await session.next()
           if (live.pumpToken === token && !live.dead) {
-            if (session.running !== true) {
+            if (session.running === true && live.replayFilter !== undefined) {
+              event = consumeBgReplay(live, event)
+              if (event === null) continue
+            } else if (session.running !== true) {
               if (event?.type === 'text') live.bgStdoutText += event.text ?? ''
               else if (event?.type === 'thought') live.bgStdoutThoughtChars += (event.text ?? '').length
               else if (event?.type === 'activity') live.bgStdoutActivities += 1
+              else if (event?.type === 'error' && live.state === 'idle' && (live.cliFullyIdle === false || live.background === true)) {
+                const notifyNow = !live.background
+                live.cliFullyIdle = true
+                live.cliBgLostError = event.error ?? new Error('CLI exited')
+                if (notifyNow) {
+                  void Promise.resolve(this.deps.onBackgroundLost?.(live.sessionId, event.error)).catch(() => {
+                    // Kept in cliBgLostError if Turn 1 has not reached turn/end yet.
+                  })
+                }
+              }
             }
             live.push(event)
           }
@@ -1005,6 +1131,17 @@ export class LocalAgentAdapter extends LlmAdapter {
     live.state = 'running'
     live.cancellingTurn = false
     resetBgStdout(live)
+    if (live.spec.hookSteer === true && live.bgReplayQueue.length > 0) {
+      const steps = live.bgReplayQueue.splice(0)
+      live.replayFilter = {
+        textRem: steps.map(step => step.text).join(''),
+        thinkRem: steps.map(step => step.thinking).join(''),
+        toolsRem: steps.reduce((sum, step) => sum + (step.toolCount ?? 0), 0),
+        deadline: Date.now() + 2_000,
+      }
+    } else {
+      live.replayFilter = undefined
+    }
     // The turn an engine names is the one this stream reads: a finished turn's late
     // events carry another id and are dropped instead of answering this one (#1513).
     live.turnTag = undefined
@@ -1099,6 +1236,11 @@ export class LocalAgentAdapter extends LlmAdapter {
           const pending = live.pending.get(event.dshCallId)
           live.pending.delete(event.dshCallId)
           pending?.resolve({ text: 'session unavailable in background', isError: true })
+        } else if (event.type === 'error') {
+          live.cliFullyIdle = true
+          live.background = false
+          await Promise.resolve(this.deps.onBackgroundLost?.(live.sessionId, event.error)).catch(() => {})
+          break
         }
       }
     } finally {

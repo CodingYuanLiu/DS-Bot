@@ -400,11 +400,19 @@ export function install(rt) {
     if (sessionId === undefined) return false
     const turnRunning = live.get(sessionId)?.turn !== undefined
     const subRunning = hasSubagents?.(sessionId) === true
-    if (!turnRunning && !subRunning) return false
+    const cliBgRunning = rt.isLocalAgentBackgroundBusy?.(sessionId) === true || rt.activeCliBackgroundWork?.(sessionId) !== undefined
+    if (!turnRunning && !subRunning && !cliBgRunning) return false
     await stopSubagents(sessionId)
+    if (cliBgRunning) rt.cancelLocalAgentTurn?.(sessionId, 'the turn was stopped by the user')
     if (turnRunning) {
       const agent = await rt.resolveAgent(sessionId).catch(() => undefined)
       agent?.cancel?.({ kind: 'user' })
+    } else if (cliBgRunning) {
+      const released = rt.releaseCliBackgroundWork?.(sessionId)
+      if (released !== undefined) {
+        const asker = rt.workAsker?.(released.parent)
+        if (asker !== undefined) tellSender(sessionId, asker, `${rt.botOf(botId)?.name ?? 'The other Bot'} was stopped before it could answer your message.`)
+      }
     }
     return true
   }
@@ -470,10 +478,11 @@ export function install(rt) {
   // Roles whose turn owes the sender a reply: a 'stopped' notice asks the Bot to
   // acknowledge, exactly like a request.
   const expectsReply = info => info.role === 'request' || info.role === 'stopped'
+  const answersHeldWork = (id, info) => info?.role === 'background' && info.work !== undefined && rt.ownsWork?.(rt.selfOf(id), info.work)
   // A group Session speaks only in its group, so what its turns write goes there, also
   // for turns that a finished background job or a fresh part starts; a Bot's private
   // message to it is answered privately.
-  const speaksInGroup = (id, info) => rt.groupOwners.has(id) && !(info !== undefined && expectsReply(info))
+  const speaksInGroup = (id, info) => rt.groupOwners.has(id) && !(info !== undefined && (expectsReply(info) || answersHeldWork(id, info)))
 
   // The group hears what the member says while it works. A text with a tool call goes
   // on at once; one without may be the turn's last, so it waits for the next text or the
@@ -530,7 +539,7 @@ export function install(rt) {
       entry.joined = info.joined.filter(item => item?.info !== undefined && item.info !== null)
     }
     if (rt.groupOwners.has(sessionId)) return
-    if ((expectsReply(info) && !answersUser(info)) || info.role === 'room' || (info.role === 'handoff' && info.resume !== true)) {
+    if ((expectsReply(info) && !answersUser(info)) || answersHeldWork(sessionId, info) || info.role === 'room' || (info.role === 'handoff' && info.resume !== true)) {
       markExchangeTurn(sessionId, entry.turn)
     }
   }
@@ -547,6 +556,11 @@ export function install(rt) {
     }
     for (const [id, map] of subagentsByParent) {
       if (map.size === 0) continue
+      const owner = rt.groupOwners.get(id)
+      const botId = owner?.botId ?? rt.chatOwners.get(id)
+      if (botId !== undefined) merged[botId] ??= 'working'
+    }
+    for (const id of rt.localAgentBusySessions?.() ?? []) {
       const owner = rt.groupOwners.get(id)
       const botId = owner?.botId ?? rt.chatOwners.get(id)
       if (botId !== undefined) merged[botId] ??= 'working'
@@ -600,6 +614,13 @@ export function install(rt) {
       if (botId === undefined || bots[botId] !== undefined) continue
       bots[botId] = { ...sub, ...(owner ? { roomId: owner.roomId } : {}) }
     }
+    for (const id of rt.localAgentBusySessions?.() ?? []) {
+      const owner = rt.groupOwners.get(id)
+      const botId = owner?.botId ?? rt.chatOwners.get(id)
+      if (botId === undefined || bots[botId] !== undefined) continue
+      const since = rt.activeCliBackgroundWork?.(id)?.since ?? Date.now()
+      bots[botId] = { since, tool: 'subagent', ...(owner ? { roomId: owner.roomId } : {}) }
+    }
     for (const job of rt.switchJobs()) {
       // `folder` marks the switch the chat must name: the working folder changed. A
       // group's own Session belongs to no Bot; the group's row shows it instead.
@@ -640,6 +661,13 @@ export function install(rt) {
       const owner = rt.groupOwners.get(id)
       const sub = owner !== undefined ? subagentDoingOf(id) : undefined
       if (sub !== undefined) add(owner.roomId, owner.botId, sub)
+    }
+    for (const id of rt.localAgentBusySessions?.() ?? []) {
+      const owner = rt.groupOwners.get(id)
+      if (owner !== undefined) {
+        const since = rt.activeCliBackgroundWork?.(id)?.since ?? Date.now()
+        add(owner.roomId, owner.botId, { since, tool: 'subagent' })
+      }
     }
     for (const job of rt.switchJobs()) {
       // `self`: the group's own Session moves; the group's activity row names it.
@@ -919,7 +947,12 @@ export function install(rt) {
         }
         break
       case 'user/message': {
-        const source = event.data?.source
+        let source = event.data?.source
+        if (source?.kind === SOURCE_KIND && source.role === 'background' && source.work === undefined) {
+          const activeCli = rt.activeCliBackgroundWork?.(id)
+          if (activeCli !== undefined) source = { ...source, work: activeCli.parent }
+          else rt.consumeAbandonedCliRun?.(id, rt.localAgentCliBackgroundState?.(id)?.gen ?? 0)
+        }
         if (source?.kind === 'subagent-settled' || source?.kind === 'agent-message') {
           const childId = typeof source.senderSessionId === 'string' ? source.senderSessionId : undefined
           // Only settlement ends a child's turn; an intermediate `agent-message` keeps the
@@ -1288,6 +1321,35 @@ export function install(rt) {
             .catch(error => rt.warn('ds-bot: answer from %s not sent: %s', name, error))
         }
         // A retried turn answers the same waiter or sender, so this one passes nothing on.
+        let deferredLostError
+        if (!retry) {
+          const turnWork = info !== undefined ? rt.workOf?.(info) : undefined
+          const ownsTurnWork = turnWork !== undefined && rt.ownsWork?.(rt.selfOf(id), turnWork)
+          const rawBgState = rt.localAgentCliBackgroundState?.(id)
+          const cliBusy = rt.isLocalAgentBackgroundBusy?.(id) === true || rawBgState?.busy === true
+          const bgGen = rawBgState?.gen ?? 0
+          const bgLostError = rawBgState?.lostError
+          if (ownsTurnWork) {
+            if (failure !== undefined || reason?.kind === 'aborted') {
+              rt.clearLocalAgentCliBackgroundLost?.(id)
+              rt.releaseCliBackgroundWork?.(id, turnWork)
+            } else if (bgLostError !== undefined) {
+              deferredLostError = rt.clearLocalAgentCliBackgroundLost?.(id) ?? bgLostError
+              rt.holdCliBackgroundWork?.(id, turnWork, bgGen)
+            } else if (cliBusy) {
+              rt.holdCliBackgroundWork?.(id, turnWork, bgGen)
+            } else {
+              rt.releaseCliBackgroundWork?.(id, turnWork)
+            }
+          } else if (!cliBusy) {
+            const activeCli = rt.activeCliBackgroundWork?.(id)
+            if (activeCli !== undefined) {
+              const alreadyDeferred = later.some(result => rt.workOf?.(result.info) === activeCli.parent)
+              if (alreadyDeferred) rt.releaseCliBackgroundWork?.(id, activeCli.parent)
+              else rt.onCliBackgroundSettledDuringOtherTurn?.(id)
+            }
+          }
+        }
         if (!retry && info?.role === 'room') {
           const waiter = roomWaiters.get(info.exchangeId)
           roomWaiters.delete(info.exchangeId)
@@ -1308,6 +1370,7 @@ export function install(rt) {
           else if (reason?.kind !== 'aborted') void rt.lateRoomReply?.(id, info ?? {}, groupReply(), { shown, toolCount })
         } else if (!retry && info !== undefined) {
           finish(info, replyText())
+          if (deferredLostError !== undefined) rt.onCliBackgroundLost?.(id, deferredLostError)
         }
         for (const request of joined) {
           if (request.info.role === 'room' && stoppedRoomTurns.delete(request.info.exchangeId)) continue
@@ -1431,5 +1494,11 @@ export function install(rt) {
     }, 'ds-bot: prompt rejection reasons')
   }
 
-  Object.assign(rt, { live, liveOf, roomWaiters, roomProgress, roomInbox, activityView, workView, roomWorkView, turnsView, steeredView, callDetail, doingOf, stopRoomTurn, stopChat, releaseBot, unblockBots, resumeBot, markSteerCut, noteCliWork, hasSubagents, stopSubagents, adoptLiveWork })
+  const runningWorkOfSession = (id) => {
+    const entry = live.get(id)
+    const work = entry?.turn !== undefined && entry.info !== undefined ? rt.workOf?.(entry.info) : undefined
+    return work !== undefined && rt.ownsWork?.(rt.selfOf(id), work) ? work : undefined
+  }
+
+  Object.assign(rt, { live, liveOf, roomWaiters, roomProgress, roomInbox, activityView, workView, roomWorkView, turnsView, steeredView, callDetail, doingOf, stopRoomTurn, stopChat, releaseBot, unblockBots, resumeBot, markSteerCut, noteCliWork, hasSubagents, stopSubagents, adoptLiveWork, runningWorkOfSession })
 }

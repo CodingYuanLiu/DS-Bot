@@ -500,6 +500,7 @@ export function readAgyTranscriptWakeup(transcriptPath, watermark, { allowIncomp
   }
   const fullMap = neededFull.size > 0 ? loadFullStepMap(transcriptPath, neededFull) : undefined
   const events = []
+  const replaySteps = []
   let maxStepIndex = floor
   let consumedEnd = slice.consumedEnd
   let unresolvedTruncated = false
@@ -531,12 +532,15 @@ export function readAgyTranscriptWakeup(transcriptPath, watermark, { allowIncomp
           missingFull = true
         }
       }
-      if (typeof step.thinking === 'string' && step.thinking.trim() !== '') {
-        events.push({ type: 'thought', text: step.thinking })
+      const stepThinking = typeof step.thinking === 'string' && step.thinking.trim() !== '' ? step.thinking : ''
+      let stepText = ''
+      if (stepThinking !== '') {
+        events.push({ type: 'thought', text: stepThinking })
       }
       if (typeof step.content === 'string' && step.content.trim() !== '') {
         const suffix = missingFull && truncated.includes('content') ? '\n\n[Output truncated — full transcript unavailable]' : ''
         const contentText = `${step.content}${suffix}`
+        stepText = step.content
         const prev = events.at(-1)
         events.push({ type: 'text', text: prev?.type === 'text' ? `\n\n${contentText}` : contentText })
       } else if (missingFull && truncated.includes('content')) {
@@ -544,11 +548,13 @@ export function readAgyTranscriptWakeup(transcriptPath, watermark, { allowIncomp
         const notice = '[Output truncated — full transcript unavailable]'
         events.push({ type: 'text', text: prev?.type === 'text' ? `\n\n${notice}` : notice })
       }
-      if (Array.isArray(step.tool_calls)) {
-        for (const call of step.tool_calls) {
-          const name = call?.name ?? call?.tool_name ?? 'tool'
-          events.push({ type: 'activity', text: `▸ ${name}` })
-        }
+      const toolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : []
+      for (const call of toolCalls) {
+        const name = call?.name ?? call?.tool_name ?? 'tool'
+        events.push({ type: 'activity', text: `▸ ${name}` })
+      }
+      if (stepText !== '' || stepThinking !== '' || toolCalls.length > 0) {
+        replaySteps.push({ text: stepText, thinking: stepThinking, toolCount: toolCalls.length })
       }
     }
     if (typeof rawStep.step_index === 'number' && rawStep.step_index > maxStepIndex) maxStepIndex = rawStep.step_index
@@ -562,6 +568,7 @@ export function readAgyTranscriptWakeup(transcriptPath, watermark, { allowIncomp
   }
   return {
     events,
+    replaySteps,
     unresolvedTruncated,
     watermark: { filePath: transcriptPath, byteOffset: consumedEnd, maxStepIndex },
   }

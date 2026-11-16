@@ -34,7 +34,7 @@ const seed = () => ({
 
 // A host over the plugin's own folder. Starting the same folder again is a restart:
 // the first host is closed before the second one starts.
-async function startHost(home, team) {
+async function startHost(home, team, extraConfig = {}) {
   if (team !== undefined) writeFileSync(join(home, 'state.json'), JSON.stringify(team))
   const ctx = fakeContext()
   const agents = new Map()
@@ -90,7 +90,7 @@ async function startHost(home, team) {
     route = options
     return register(options)
   }
-  rt = createRuntime(ctx, { home })
+  rt = createRuntime(ctx, { home, ...extraConfig })
   let seq = 0
   const emit = (id, type, data) => {
     for (const listener of ctx.listeners.get('session/event') ?? []) {
@@ -122,7 +122,7 @@ function bench(t) {
     for (const host of hosts.reverse()) await host.stop()
     rmSync(home, { recursive: true, force: true, maxRetries: 5 })
   })
-  return { home, start: async team => { const host = await startHost(home, team); hosts.push(host); return host } }
+  return { home, start: async (team, extraConfig) => { const host = await startHost(home, team, extraConfig); hosts.push(host); return host } }
 }
 
 const textBlock = content => [{ type: 'text', text: content }]
@@ -582,4 +582,208 @@ test('a continued subagent hands up each run\'s own result', async (t) => {
   assert.ok(answer.includes('COST: 42'), `the first run's result goes up: ${answer}`)
   assert.ok(answer.includes('SCHEDULE: Monday'), `the second run's result goes up: ${answer}`)
   assert.ok(answer.indexOf('COST: 42') < answer.indexOf('SCHEDULE: Monday'), `in run order: ${answer}`)
+})
+
+test('local CLI in-process subagents hold Bot-to-Bot work across Stop(fullyIdle:false) and deliver the final background synthesis to the asking Bot', async (t) => {
+  const { start } = bench(t)
+  const first = await start(seed())
+  const { agents, emit, tool, call } = first
+  const turns = turnTaker(agents, emit)
+
+  let bBusy = false
+  rt.isLocalAgentBackgroundBusy = id => id === 'b' && bBusy
+  rt.localAgentBusySessions = () => (bBusy ? ['b'] : [])
+
+  // 1. Chief ('a') asks Writer ('b') to investigate; Writer starts an internal CLI subagent (`bBusy = true`).
+  turns.userTurn('a', 'ask Writer to inspect scale-up pods')
+  await tool('message_bot', { to: 'Writer', message: 'inspect qwen3.7 scale-up pods' }, 'a')
+  turns.end('a', 'asked Writer')
+
+  turns.take('b')
+  bBusy = true
+  turns.end('b', 'Started subagent inspector, will report back shortly.')
+
+  // Interim reply must NOT settle the exchange or reach Chief prematurely!
+  await delay(40)
+  assert.equal(callsOf(agents, 'a').length, 0, 'does not prematurely deliver Turn 1 interim acknowledgement to Chief')
+  const heldWorks = await worksIn(first)
+  const [parentEntry] = Object.entries(heldWorks).filter(([, w]) => w.to === 'b')
+  assert.ok(parentEntry !== undefined, 'parent work stays open')
+  assert.equal(parentEntry[1].open.length, 1)
+  assert.match(parentEntry[1].open[0], /^cli-bg:/)
+  assert.equal(rt.activityView().b, 'working')
+  assert.match(rt.statusOf('b'), /waiting for background subagent to hand back work, for Chief/)
+
+  // 2. Stage 1 subagent finishes and spawns Stage 2 (`bBusy` still true): still holds!
+  emit('b', 'turn/start', { turn: 2 })
+  emit('b', 'user/message', {
+    content: textBlock('[Background update]'),
+    source: { kind: SOURCE_KIND, form: 'relay', role: 'background' },
+  })
+  emit('b', 'assistant/message', assistantText('Stage 1 checked logs, running Stage 2 pod triage…'))
+  emit('b', 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+  await delay(40)
+  assert.equal(callsOf(agents, 'a').length, 0, 'still holds while Stage 2 CLI subagent runs')
+
+  // 3. Stage 2 finishes (`bBusy = false`): synthesized conclusion is delivered automatically to Chief!
+  bBusy = false
+  emit('b', 'turn/start', { turn: 3 })
+  emit('b', 'user/message', {
+    content: textBlock('[Background update]'),
+    source: { kind: SOURCE_KIND, form: 'relay', role: 'background' },
+  })
+  emit('b', 'assistant/message', assistantText('Root cause: 2 scale-up pods stalled pulling image tag v2.4.'))
+  emit('b', 'turn/end', { turn: 3, reason: { kind: 'completed' } })
+
+  await settled(() => callsOf(agents, 'a').length === 1)
+  const replyMsg = textOf(callsOf(agents, 'a')[0][1].content)
+  assert.match(replyMsg, /^\[Reply from Writer\]\nRoot cause: 2 scale-up pods stalled pulling image tag v2\.4\.$/)
+  const stateView = (await call('state', {})).value
+  assert.deepEqual(stateView.exchangeTurns.b, [1, 2, 3], 'all exchange turns including background wakeups stay hidden from Writer user chat')
+  assert.deepEqual(await worksIn(first), {})
+})
+
+test('stopChat cancels a pending local CLI background subagent and notifies the waiting Bot', async (t) => {
+  const { start } = bench(t)
+  const first = await start(seed())
+  const { agents, emit, tool } = first
+  const turns = turnTaker(agents, emit)
+
+  let bBusy = true
+  let cancelledSession
+  rt.isLocalAgentBackgroundBusy = id => id === 'b' && bBusy
+  rt.cancelLocalAgentTurn = (id) => { cancelledSession = id; bBusy = false }
+
+  turns.userTurn('a', 'ask Writer')
+  await tool('message_bot', { to: 'Writer', message: 'long investigation' }, 'a')
+  turns.end('a', 'sent')
+  turns.take('b')
+  turns.end('b', 'subagent running')
+  await delay(30)
+  assert.equal(callsOf(agents, 'a').length, 0)
+
+  assert.equal(await rt.stopChat('b'), true)
+  assert.equal(cancelledSession, 'b')
+  await settled(() => callsOf(agents, 'a').length === 1)
+  assert.match(textOf(callsOf(agents, 'a')[0][1].content), /Writer was stopped before it could answer your message\./)
+  assert.deepEqual(await worksIn(first), {})
+})
+
+test('host restart recovers interrupted local CLI background subagent waits so the recipient finishes and answers the sender', async (t) => {
+  const { start } = bench(t)
+  const first = await start(seed(), { resumeDelayMs: 20 })
+  const { agents, emit, tool } = first
+  const turns = turnTaker(agents, emit)
+
+  rt.isLocalAgentBackgroundBusy = id => id === 'b'
+  turns.userTurn('a', 'ask Writer')
+  await tool('message_bot', { to: 'Writer', message: 'check deployment readiness' }, 'a')
+  turns.end('a', 'asked')
+  turns.take('b')
+  turns.end('b', 'spawned subagent before restart')
+  await delay(30)
+  assert.equal(callsOf(agents, 'a').length, 0)
+  await first.stop()
+
+  // Restart host (`isLocalAgentBackgroundBusy` is now false because old CLI child exited with old daemon).
+  const second = await start(undefined, { resumeDelayMs: 20 })
+  await settled(() => callsOf(second.agents, 'b').length === 1)
+  const resumeMsg = callsOf(second.agents, 'b')[0][1]
+  assert.match(textOf(resumeMsg.content), /DeepSeek Harness restarted while your background subagent was running/)
+
+  const secondTurns = turnTaker(second.agents, second.emit)
+  secondTurns.take('b')
+  secondTurns.end('b', 'Checked after restart: deployment revision 42 is 4/4 Ready.')
+  await settled(() => callsOf(second.agents, 'a').length === 1)
+  assert.match(textOf(callsOf(second.agents, 'a')[0][1].content), /^\[Reply from Writer\]\nChecked after restart: deployment revision 42 is 4\/4 Ready\.$/)
+  assert.deepEqual(await worksIn(second), {})
+})
+
+test('CLI background waits resist theft by unrelated requests, respect abandon-work without re-holding, settle multi-child stopChat, and deduplicate restart/later continuations', async (t) => {
+  const { start } = bench(t)
+  const first = await start(seed())
+  const { agents, emit, tool, call } = first
+  const turns = turnTaker(agents, emit)
+
+  let bBusy = false
+  let bGen = 0
+  let bLost
+  rt.isLocalAgentBackgroundBusy = id => id === 'b' && bBusy
+  rt.localAgentCliBackgroundState = id => (id === 'b' ? { busy: bBusy, gen: bGen, lostError: bLost } : { busy: false, gen: 0, lostError: undefined })
+  rt.clearLocalAgentCliBackgroundLost = (id) => { const err = id === 'b' ? bLost : undefined; if (id === 'b') bLost = undefined; return err }
+  rt.cancelLocalAgentTurn = () => { bBusy = false }
+
+  // 1. P1 #1: Chief ('a') asks Writer ('b'); Writer spawns CLI subagent (gen 1). Tester ('c') also asks Writer; Tester's turn must NOT steal Chief's CLI wait!
+  turns.userTurn('a', 'ask Writer')
+  await tool('message_bot', { to: 'Writer', message: 'task from Chief' }, 'a')
+  turns.end('a', 'asked')
+  turns.take('b')
+  bBusy = true
+  bGen = 1
+  turns.end('b', 'CLI subagent started for Chief')
+  await delay(20)
+
+  turns.userTurn('c', 'ask Writer quick question')
+  await tool('message_bot', { to: 'Writer', message: 'quick ping from Tester' }, 'c')
+  turns.end('c', 'asked')
+  turns.take('b')
+  turns.end('b', 'Direct quick reply to Tester')
+  await settled(() => callsOf(agents, 'c').length === 1)
+  assert.match(textOf(callsOf(agents, 'c')[0][1].content), /Direct quick reply to Tester/, 'Tester gets its direct answer')
+  assert.equal(callsOf(agents, 'a').length, 0, 'Chief is still waiting on its own CLI subagent')
+
+  // 2. P1 #2: User clicks "Give up waiting" (`abandon-work`) while CLI remains busy (gen 1) -> follow-up must NOT recreate the wait!
+  const beforeAbandon = await worksIn(first)
+  const [cliWorkId] = Object.entries(beforeAbandon).find(([, w]) => w.cliSession === 'b')
+  assert.equal((await call('abandon-work', { id: cliWorkId })).ok, true)
+  await settled(() => callsOf(agents, 'b').length === 3)
+  turns.take('b')
+  // CLI is STILL busy on gen 1 while Writer answers the abandonment follow-up!
+  turns.end('b', 'Subagent timed out; reporting partial check to Chief.')
+  await settled(() => callsOf(agents, 'a').length === 1)
+  assert.match(textOf(callsOf(agents, 'a')[0][1].content), /Subagent timed out; reporting partial check to Chief\./)
+  assert.deepEqual(await worksIn(first), {})
+
+  // Abandoned gen 1 finally finishes later: must not settle anything a second time.
+  bBusy = false
+  emit('b', 'turn/start', { turn: 99 })
+  emit('b', 'user/message', { content: textBlock('[Background update]'), source: { kind: SOURCE_KIND, form: 'relay', role: 'background' } })
+  emit('b', 'assistant/message', assistantText('late abandoned output'))
+  emit('b', 'turn/end', { turn: 99, reason: { kind: 'completed' } })
+  await delay(25)
+  assert.equal(callsOf(agents, 'a').length, 1)
+
+  // 3. P1 #5: Writer delegates BOTH to Bot 'd' AND a CLI subagent (gen 2), then user calls stopChat('b') -> Chief gets stopped notice immediately!
+  turns.userTurn('a', 'second request')
+  await tool('message_bot', { to: 'Writer', message: 'combined work' }, 'a')
+  turns.end('a', 'sent 2')
+  turns.take('b')
+  await tool('message_bot', { to: 'Editor', message: 'part for Editor' }, 'b')
+  bBusy = true
+  bGen = 2
+  turns.end('b', 'waiting on both Editor and CLI subagent')
+  await delay(25)
+  assert.equal(callsOf(agents, 'a').length, 1)
+
+  assert.equal(await rt.stopChat('b'), true)
+  await settled(() => callsOf(agents, 'a').length === 2)
+  assert.match(textOf(callsOf(agents, 'a')[1][1].content), /Writer was stopped before it could answer your message\./)
+
+  // 4. P2 #7: CLI crashes right before Turn 1's turn/end (`bLost` set, `bBusy` already false) -> holds Turn 1 and queues recovery reply instead of sending premature acknowledgement!
+  turns.userTurn('a', 'third request')
+  await tool('message_bot', { to: 'Writer', message: 'crash edge case' }, 'a')
+  turns.end('a', 'sent 3')
+  const bCallsBefore = callsOf(agents, 'b').length
+  turns.take('b')
+  bBusy = false
+  bGen = 3
+  bLost = new Error('agy exited (SIGKILL)')
+  turns.end('b', 'Started subagent right before crash')
+  await settled(() => callsOf(agents, 'b').length === bCallsBefore + 1)
+  assert.equal(callsOf(agents, 'a').length, 2, 'premature acknowledgement was held when CLI crashed before turn/end')
+  assert.match(textOf(callsOf(agents, 'b').at(-1)[1].content), /Your background subagent stopped unexpectedly \(agy exited \(SIGKILL\)\)/)
+  turns.take('b')
+  turns.end('b', 'Recovered after crash and completed check.')
+  await settled(() => callsOf(agents, 'a').length === 3)
+  assert.match(textOf(callsOf(agents, 'a')[2][1].content), /Recovered after crash and completed check\./)
 })
