@@ -121,9 +121,9 @@ export function install(rt) {
       if (record !== undefined) Object.assign(record, patch)
     },
     presetFor: (sessionId) => {
-      if (isSideSession(sessionId)) return 'read-only'
-      const bot = rt.botOf(rt.selfOf(sessionId))
-      const room = rt.roomOf(rt.groupOwners.get(sessionId)?.roomId)
+      const targetId = sideOwners.get(sessionId) ?? sessionId
+      const bot = rt.botOf(rt.selfOf(targetId))
+      const room = rt.roomOf(rt.groupOwners.get(targetId)?.roomId)
       return room?.permission ?? bot?.permission ?? 'workspace-write'
     },
     cwdFor: async (sessionId) => {
@@ -152,7 +152,7 @@ export function install(rt) {
       rt.noteCliWork?.(sessionId, stepTexts)
     },
     onBackgroundWake: async (sessionId) => {
-      if (isSideSession(sessionId)) return false
+      if (isSideSession(sessionId)) return (await rt.onSideBackgroundWake?.(sessionId)) === true
       const agent = await rt.resolveAgent(sessionId).catch(() => undefined)
       if (typeof agent?.followup !== 'function') return false
       const already = (agent.inbox?.nextTurn ?? []).some(msg => msg?.source?.kind === SOURCE_KIND && msg.source.role === 'background')
@@ -166,6 +166,7 @@ export function install(rt) {
       return true
     },
     onBackgroundSettled: async (sessionId) => {
+      if (isSideSession(sessionId)) return
       const agent = await rt.resolveAgent(sessionId).catch(() => undefined)
       if (typeof agent?.inbox?.remove !== 'function') return
       let removed = false
@@ -347,6 +348,9 @@ export function install(rt) {
     registerLocalAgentSideSession: (sideSessionId, mainSessionId) => {
       sideOwners.set(String(sideSessionId), String(mainSessionId))
     },
+    isLocalAgentSideBusy: sideSessionId => adapter.isSideSessionBusy(String(sideSessionId)),
+    hasLocalAgentSideBackground: sideSessionId => adapter.hasSideSessionBackground(String(sideSessionId)),
+    cancelLocalAgentSideTurn: (sideSessionId, reason) => adapter.cancelSideTurn(String(sideSessionId), reason),
     closeLocalAgentSideSession: async (sideSessionId) => {
       const id = String(sideSessionId)
       sideOwners.delete(id)

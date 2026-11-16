@@ -172,9 +172,10 @@ export function install(rt) {
     // Named apart from the state view's `computer`: the live answer merges into the
     // same object and would wipe its `enabled` and `provider` fields.
     computerLive: rt.computerLive?.() ?? {},
-    // Browser holds (handoffs and takeovers) change without bumping state.revision,
-    // so they ride on live() to reconcile unchanged-revision polls.
+    // Browser holds (handoffs and takeovers) and streaming side-chat answers change
+    // without bumping state.revision, so they ride on live() to reconcile polls.
     browserHolds: rt.browserChannel?.holdSnapshot?.() ?? {},
+    sideChats: rt.sideView?.() ?? {},
   })
   // The live fields' sources are spread across the host with no single change
   // counter, so the serialized answer itself is the detector: a poll whose `live`

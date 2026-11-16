@@ -162,3 +162,40 @@ test('while an answer runs, Enter and the send button stay quiet', async () => {
   assert.deepEqual(plain(asked), [])
   assert.equal(sendButton(instance.render()).props.disabled, true)
 })
+
+test('answering entry renders streaming Markdown and current tool/subagent activity step alongside Cancel', () => {
+  const streaming = {
+    id: 'c1',
+    entries: [{
+      id: 'e1',
+      question: 'Check status',
+      answer: 'Checking via subagent…',
+      activity: '▸ Invoke Subagent',
+      status: 'answering',
+    }],
+  }
+  const instance = mount({
+    subject: 'b1',
+    chat: streaming,
+    roster: { ready: true, prefs: {}, byId: { b1: { id: 'b1', engine: 'local-antigravity' } } },
+    actions: { askSide: async () => {}, cancelSide: async () => {} },
+  })
+  const expand = (node) => {
+    if (Array.isArray(node)) return node.map(expand)
+    if (!node || typeof node !== 'object') return node
+    if (typeof node.type === 'function' && node.type.name === 'SideEntry') {
+      current = instance
+      const inner = node.type(node.props)
+      current = undefined
+      return expand(inner)
+    }
+    return { ...node, props: { ...node.props, children: expand(node.props?.children) } }
+  }
+  const rendered = expand(instance.render())
+  const [note] = all(rendered, child => child.props?.className === 'bt-side-note')
+  assert.equal(note.props.children[0], 'Isolated side session — runs without interrupting the main chat')
+  const [step] = all(rendered, child => typeof child.props?.className === 'string' && child.props.className.includes('bt-side-step'))
+  assert.equal(step.props.children[0], '▸ Invoke Subagent')
+  const [md] = all(rendered, child => typeof child.type === 'function' && child.props?.text === 'Checking via subagent…')
+  assert.ok(md, 'renders live partial Markdown answer while status is answering')
+})

@@ -796,20 +796,56 @@ test('local-agent /side runs concurrently in an isolated read-only session witho
 
   const e1 = chatOf(rt, q1.value.chatId).entries[0]
   assert.equal(e1.status, 'done', e1.error)
-  assert.match(e1.answer, /mode=default/, 'side session is forced to read-only mode even when Bot is danger-full-access')
+  assert.match(e1.answer, /mode=auto/, 'side session inherits the main Bot permission preset so run_command and invoke_subagent work')
   assert.match(e1.answer, /mcp=no/, 'side session attaches no team MCP server')
   assert.match(e1.answer, /open=2/, 'multiplexes a second session inside the same agy worker process')
-  assert.match(e1.answer, /readOk=true writeBlocked=true/, 'allows read-only inspection while rejecting mutating permissions')
+  assert.match(e1.answer, /readOk=true execOk=true/, 'allows read and command execution under danger-full-access')
   assert.match(e1.answer, new RegExp(`cwd=${workDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.match(e1.answer, /Analyze benchmark logs in detail/, 'receives the main chat snapshot')
   assert.doesNotMatch(e1.answer, new RegExp(`session=${mainAcpId}\\b`), 'uses an isolated acpSessionId')
 
-  // 3. Main chat progresses; ask follow-up Question 2 in the SAME Side Chat tab.
+  // 3. Subagent + streaming progress in /side: streams live text & `▸` activity over live()
+  //    without writing `activity` to disk, then catches async background wakeup after Turn 1!
+  const baseState = (await callApi('state', {})).value
+  const subReady = join(tmpRoot, 'side-sub.ready')
+  const subRelease = join(tmpRoot, 'side-sub.release')
+  const qSub = await callApi('side-ask', {
+    sessionId: 's-now',
+    chatId: q1.value.chatId,
+    text: `side-subagent-stream:${subReady}|${subRelease}`,
+  })
+  assert.equal(qSub.ok, true, qSub.error?.message)
+  for (let i = 0; i < 200 && !existsSync(subReady); i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 15))
+  }
+  assert.equal(existsSync(subReady), true, 'side subagent turn 1 is streaming')
+  await new Promise(resolve => setTimeout(resolve, 25))
+
+  const livePoll = (await callApi('state', {
+    since: baseState.revision + 1,
+    models: baseState.modelsKey,
+    live: baseState.liveKey,
+  })).value
+  const streamingEntry = livePoll.sideChats?.b1?.find(c => c.id === q1.value.chatId)?.entries?.[1]
+  assert.equal(streamingEntry?.status, 'answering')
+  assert.equal(streamingEntry?.answer, 'Launching subagent inspector.')
+  assert.equal(streamingEntry?.activity, '▸ Invoke Subagent')
+  const diskDuringStream = JSON.parse(readFileSync(join(runtimeHome, 'side', 'b1.json'), 'utf8'))
+  assert.equal('activity' in (diskDuringStream[0]?.entries?.[1] ?? {}), false, 'transient activity is not written to disk')
+
+  writeFileSync(subRelease, 'go', 'utf8')
+  await rt.sideJoin(qSub.value.entryId)
+  const eSub = chatOf(rt, q1.value.chatId).entries[1]
+  assert.equal(eSub.status, 'done', eSub.error)
+  assert.equal(eSub.activity, undefined)
+  assert.equal(eSub.answer, 'Launching subagent inspector.\n\nSubagent report: all 3 checks green.')
+
+  // 4. Main chat progresses; ask follow-up Question 3 in the SAME Side Chat tab after background wakeup.
   session.messages.push({ id: 'm2', role: 'assistant', content: [{ type: 'text', text: 'Phase 1 throughput = 420 tok/s' }], source: { kind: 'model', provider: 'local-antigravity', model: 'default' } })
   const q2 = await callApi('side-ask', { sessionId: 's-now', chatId: q1.value.chatId, text: 'side-inspect follow-up check' })
   assert.equal(q2.ok, true, q2.error?.message)
   await rt.sideJoin(q2.value.entryId)
-  const e2 = chatOf(rt, q1.value.chatId).entries[1]
+  const e2 = chatOf(rt, q1.value.chatId).entries[2]
   assert.equal(e2.status, 'done', e2.error)
   assert.match(e2.answer, /open=2/, 'reuses the same side ACP session across follow-up questions')
   assert.match(e2.answer, /Phase 1 throughput = 420 tok\/s/, 'receives incremental main-chat updates')

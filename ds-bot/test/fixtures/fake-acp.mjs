@@ -214,17 +214,35 @@ async function runPrompt(session, prompt, requestId) {
         { optionId: 'deny-read', name: 'Reject', kind: 'reject_once' },
       ],
     })
-    const writePerm = await ask('session/request_permission', {
+    const execPerm = await ask('session/request_permission', {
       sessionId,
-      toolCall: { toolCallId: 'ro-edit', kind: 'edit', title: 'Edit README' },
+      toolCall: { toolCallId: 'ro-exec', kind: 'execute', title: 'Run git status' },
       options: [
-        { optionId: 'allow-write', name: 'Allow once', kind: 'allow_once' },
-        { optionId: 'deny-write', name: 'Reject', kind: 'reject_once' },
+        { optionId: 'allow-exec', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'deny-exec', name: 'Reject', kind: 'reject_once' },
       ],
     })
     const readOk = readPerm?.result?.outcome?.optionId === 'allow-read'
-    const writeBlocked = writePerm?.result?.outcome?.optionId === 'deny-write'
-    finish(`side session=${sessionId} mode=${session.mode} mcp=${session.mcp ? 'yes' : 'no'} open=${sessions.size} readOk=${readOk} writeBlocked=${writeBlocked} cwd=${process.cwd()} saw=${JSON.stringify(text)}`)
+    const execOk = execPerm?.result?.outcome?.optionId === 'allow-exec'
+    finish(`side session=${sessionId} mode=${session.mode} mcp=${session.mcp ? 'yes' : 'no'} open=${sessions.size} readOk=${readOk} execOk=${execOk} cwd=${process.cwd()} saw=${JSON.stringify(text)}`)
+    return
+  }
+  if (text.includes('side-subagent-stream:')) {
+    const [, readyPath, releasePath] = /side-subagent-stream:([^|]+)\|([^\s]+)/.exec(text) ?? []
+    update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Launching subagent inspector.' } })
+    update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'sub-1', kind: 'other', title: 'Invoke Subagent', status: 'in_progress' })
+    if (readyPath) writeFileSync(readyPath, sessionId, 'utf8')
+    while (releasePath && !existsSync(releasePath)) {
+      await new Promise(resolve => setTimeout(resolve, 15))
+    }
+    await callSteerHook({ conversationId: sessionId, hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL', fullyIdle: false })
+    reply(requestId, { stopReason: 'end_turn' })
+    setTimeout(async () => {
+      update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'sub-2', kind: 'execute', status: 'in_progress', rawInput: { command: 'git status --short' } })
+      update(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'sub-2', status: 'completed' })
+      update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Subagent report: all 3 checks green.' } })
+      await callSteerHook({ conversationId: sessionId, hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL', fullyIdle: true })
+    }, 35)
     return
   }
   if (/\bhang\b/.test(text)) return // session/cancel releases it below

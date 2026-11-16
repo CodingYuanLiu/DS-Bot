@@ -1226,6 +1226,7 @@ export const FR = {
   "What should change?": "Que faut-il changer ?",
   "Note: {text}": "Note : {text}",
   "Answered from progress so far; nothing was run": "Répondu à partir de l’avancement actuel ; aucune action n’a été exécutée",
+  "Isolated side session — runs without interrupting the main chat": "Session latérale isolée — s’exécute sans interrompre la discussion principale",
   "Could not answer.": "Impossible de répondre.",
   "Cancel this side question": "Annuler cette question parallèle",
   "Conversations": "Discussions",

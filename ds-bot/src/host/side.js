@@ -24,7 +24,8 @@ const SIDE_PROMPT = [
 const LOCAL_SIDE_PROMPT = [
   SIDE_MARKER,
   'Answer from the conversation so far, based on progress up to this snapshot, and from this side chat.',
-  'This is an isolated read-only side chat: you may inspect or search files read-only when helpful, but never modify files, run mutating commands, or claim to have changed anything.',
+  'This is an isolated side chat: you may read files, run commands, or invoke subagents to inspect and verify facts without interrupting the main chat.',
+  'Do not modify files the main chat is working on, run destructive commands, or claim to have changed anything unless explicitly asked.',
 ].join('\n')
 const SIDE_RETRY = 'Do not call any tool. Answer in text only.'
 const GROUP_REFUSAL = "Side chat is only available in a Bot's private chat."
@@ -38,12 +39,16 @@ const localPromptFor = (question, retry) => [LOCAL_SIDE_PROMPT, ...(retry ? [SID
 // Earlier finished pairs sit between the snapshot and the new question. The
 // assistant pair carries the route tag a model-produced message needs — the
 // assembler reads `source` on every assistant message.
-const pairsOf = (chat, entry, route, withIds = false) =>
-  (chat.entries ?? []).filter(other => other !== entry && other?.status === 'done')
+const pairsOf = (chat, entry, route, withIds = false) => {
+  const list = chat.entries ?? []
+  const at = list.indexOf(entry)
+  const before = at === -1 ? list : list.slice(0, at)
+  return before.filter(other => other?.status === 'done')
     .flatMap(other => [
       { ...(withIds ? { id: `side-q-${other.id}` } : {}), role: 'user', content: [{ type: 'text', text: other.question }] },
       { ...(withIds ? { id: `side-a-${other.id}` } : {}), role: 'assistant', content: [{ type: 'text', text: other.answer }], source: { kind: 'model', provider: route?.provider, model: route?.model } },
     ])
+}
 
 const answering = chat => (chat?.entries ?? []).some(entry => entry?.status === 'answering')
 
@@ -91,7 +96,16 @@ export function install(rt) {
       await mkdir(sideDir, { recursive: true })
       const temp = `${path}.${process.pid}.tmp`
       try {
-        await writeFile(temp, JSON.stringify(chats.get(botId) ?? [], null, 2), 'utf8')
+        const serialized = (chats.get(botId) ?? []).map(chat => ({
+          ...chat,
+          entries: (chat.entries ?? []).map((item) => {
+            if (item?.activity === undefined) return item
+            const copy = { ...item }
+            delete copy.activity
+            return copy
+          }),
+        }))
+        await writeFile(temp, JSON.stringify(serialized, null, 2), 'utf8')
         await replaceFile(temp, path)
       } catch (error) {
         await unlink(temp).catch(() => {})
@@ -218,9 +232,79 @@ export function install(rt) {
     return list !== undefined && list.includes(chat) && (chat.entries ?? []).includes(entry)
   }
 
+  /** @type {Map<string, (outcome: string) => void>} */
+  const sideWakeWaiters = new Map()
+
+  const applyProgress = (baseText, entry, chat, { text, activity }) => {
+    if (entry.status !== 'answering') return
+    entry.answer = [baseText, text].filter(Boolean).join('\n\n')
+    if (activity) entry.activity = activity
+    else delete entry.activity
+    chat.updatedAt = Date.now()
+  }
+
+  function waitForSideWake(sideSessionId, signal) {
+    if (signal.aborted) return Promise.resolve('aborted')
+    if (rt.hasLocalAgentSideBackground?.(sideSessionId) === true) return Promise.resolve('woke')
+    if (rt.isLocalAgentSideBusy?.(sideSessionId) !== true) return Promise.resolve('idle')
+    return new Promise((resolve) => {
+      const finish = (outcome) => {
+        clearInterval(poll)
+        signal.removeEventListener('abort', onAbort)
+        if (sideWakeWaiters.get(sideSessionId) === finish) sideWakeWaiters.delete(sideSessionId)
+        resolve(outcome)
+      }
+      const onAbort = () => {
+        rt.cancelLocalAgentSideTurn?.(sideSessionId)
+        finish('aborted')
+      }
+      const poll = setInterval(() => {
+        if (rt.hasLocalAgentSideBackground?.(sideSessionId) === true) finish('woke')
+        else if (rt.isLocalAgentSideBusy?.(sideSessionId) !== true) finish('idle')
+      }, 250)
+      poll.unref?.()
+      sideWakeWaiters.set(sideSessionId, finish)
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  async function drainSideBackgrounds(botId, chat, entry, snapshot, extra, sideSessionId, initialText, signal) {
+    let accumulated = initialText
+    while (sideSessionId !== undefined && rt.isLocalAgentSideBusy?.(sideSessionId) === true) {
+      entry.answer = accumulated
+      if (!entry.activity) entry.activity = '▸ Subagent running…'
+      chat.updatedAt = Date.now()
+      const state = await waitForSideWake(sideSessionId, signal)
+      if (state === 'aborted' || signal.aborted || entry.status !== 'answering' || !alive(botId, chat, entry)) return null
+      if (state === 'idle' && rt.hasLocalAgentSideBackground?.(sideSessionId) !== true) break
+      const bgResult = await callAside(ctx, rt, snapshot, {
+        extra,
+        question: entry.question,
+        promptFor: localPromptFor,
+        kind: 'side',
+        signal,
+        sideSessionId,
+        entryId: entry.id,
+        backgroundWake: true,
+        onProgress: progress => applyProgress(accumulated, entry, chat, progress),
+      })
+      if (signal.aborted || entry.status !== 'answering' || !alive(botId, chat, entry)) return null
+      if (bgResult.failed !== undefined) {
+        if (accumulated !== '') break
+        return { failed: bgResult.failed }
+      }
+      if (bgResult.text !== '') {
+        accumulated = [accumulated, bgResult.text].filter(Boolean).join('\n\n')
+        entry.answer = accumulated
+      }
+    }
+    return { text: accumulated }
+  }
+
   // Only the first writer wins. Cancel sets 'cancelled' before it aborts.
   function settle(botId, chat, entry, patch) {
     if (entry.status !== 'answering' || !alive(botId, chat, entry)) return false
+    delete entry.activity
     Object.assign(entry, patch, { finishedAt: Date.now() })
     chat.updatedAt = entry.finishedAt
     return true
@@ -234,6 +318,10 @@ export function install(rt) {
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         if (signal.aborted || entry.status !== 'answering' || !alive(botId, chat, entry)) return
+        if (attempt > 0) {
+          entry.answer = ''
+          delete entry.activity
+        }
         const result = await callAside(ctx, rt, snapshot, {
           extra,
           question: entry.question,
@@ -243,6 +331,7 @@ export function install(rt) {
           signal,
           sideSessionId,
           entryId: entry.id,
+          onProgress: progress => applyProgress('', entry, chat, progress),
         })
         if (signal.aborted || entry.status !== 'answering' || !alive(botId, chat, entry)) return
         if (result.failed !== undefined) {
@@ -261,11 +350,21 @@ export function install(rt) {
           if (settle(botId, chat, entry, { status: 'failed', error: TOOL_ERROR, answer: '' })) await persist(botId)
           return
         }
-        if (result.text === '') {
+        let finalText = result.text ?? ''
+        if (localSide && sideSessionId !== undefined && rt.isLocalAgentSideBusy?.(sideSessionId) === true) {
+          const drained = await drainSideBackgrounds(botId, chat, entry, snapshot, extra, sideSessionId, finalText, signal)
+          if (drained === null) return
+          if (drained.failed !== undefined) {
+            if (settle(botId, chat, entry, { status: 'failed', error: drained.failed, answer: '' })) await persist(botId)
+            return
+          }
+          finalText = drained.text
+        }
+        if (finalText === '') {
           if (settle(botId, chat, entry, { status: 'failed', error: EMPTY_ERROR, answer: '' })) await persist(botId)
           return
         }
-        if (settle(botId, chat, entry, { status: 'done', answer: result.text })) await persist(botId)
+        if (settle(botId, chat, entry, { status: 'done', answer: finalText })) await persist(botId)
         return
       }
     } catch (error) {
@@ -274,6 +373,71 @@ export function install(rt) {
       rt.warn('ds-bot: side for %s failed: %s', botId, message)
       if (settle(botId, chat, entry, { status: 'failed', error: message, answer: '' })) await persist(botId)
     }
+  }
+
+  async function onSideBackgroundWake(sideSessionId) {
+    const id = String(sideSessionId ?? '')
+    if (!id.startsWith('side:')) return false
+    const waiter = sideWakeWaiters.get(id)
+    if (waiter !== undefined) {
+      waiter('woke')
+      return true
+    }
+    const chatId = id.slice('side:'.length)
+    for (const [botId, list] of chats) {
+      const chat = list.find(item => item?.id === chatId)
+      if (chat === undefined) continue
+      if (abandoned(botId)) return false
+      if (answering(chat)) return true
+      const entry = (chat.entries ?? []).findLast(item => item?.status === 'done')
+      if (entry === undefined) return false
+      const sessionId = rt.chatOf(botId)
+      if (sessionId === undefined) return false
+      const baseAnswer = entry.answer ?? ''
+      const controller = new AbortController()
+      entry.status = 'answering'
+      delete entry.finishedAt
+      entry.activity = '▸ Background update…'
+      chat.updatedAt = Date.now()
+      track(entry.id, botId, controller)
+      const done = (async () => {
+        try {
+          const agent = await rt.resolveAgent(sessionId)
+          if (abandoned(botId) || controller.signal.aborted || !alive(botId, chat, entry)) return
+          const snapshot = snapshotOf(agent.session, ctx.get?.('sessionProjections'))
+          const extra = pairsOf(chat, entry, snapshot.header?.config, true)
+          const bgResult = await callAside(ctx, rt, snapshot, {
+            extra,
+            question: entry.question,
+            promptFor: localPromptFor,
+            kind: 'side',
+            signal: controller.signal,
+            sideSessionId: id,
+            entryId: entry.id,
+            backgroundWake: true,
+            onProgress: progress => applyProgress(baseAnswer, entry, chat, progress),
+          })
+          if (controller.signal.aborted || entry.status !== 'answering' || !alive(botId, chat, entry)) return
+          let finalText = bgResult.text !== '' && bgResult.failed === undefined
+            ? [baseAnswer, bgResult.text].filter(Boolean).join('\n\n')
+            : baseAnswer
+          if (rt.isLocalAgentSideBusy?.(id) === true) {
+            const more = await drainSideBackgrounds(botId, chat, entry, snapshot, extra, id, finalText, controller.signal)
+            if (more === null) return
+            if (more.text) finalText = more.text
+          }
+          if (settle(botId, chat, entry, { status: 'done', answer: finalText })) await persist(botId)
+        } catch (error) {
+          if (controller.signal.aborted || entry.status !== 'answering' || !alive(botId, chat, entry)) return
+          rt.warn('ds-bot: side background wake for %s failed: %s', botId, error?.message ?? error)
+          if (settle(botId, chat, entry, { status: 'done', answer: baseAnswer })) await persist(botId)
+        }
+      })().finally(() => untrack(entry.id))
+      const flight = flights.get(entry.id)
+      if (flight !== undefined) flight.done = done
+      return true
+    }
+    return false
   }
 
   const newChat = botId => ({ id: randomUUID(), botId, createdAt: Date.now(), updatedAt: Date.now(), entries: [] })
@@ -359,9 +523,11 @@ export function install(rt) {
       if (entry === undefined) throw new Error(ENTRY_ERROR)
       if (entry.status !== 'answering') return { answering: false }
       entry.status = 'cancelled'
+      delete entry.activity
       entry.finishedAt = Date.now()
       chat.updatedAt = entry.finishedAt
       flights.get(entryId)?.controller.abort()
+      rt.cancelLocalAgentSideTurn?.(`side:${chatId}`)
       await persist(botId)
       return { answering: true }
     }
@@ -423,5 +589,5 @@ export function install(rt) {
 
   const sideJoin = id => flights.get(id)?.done ?? Promise.resolve()
 
-  Object.assign(rt, { sideNew, sideAsk, sideCancel, sideClose, sideJoin, sideDispose, sideView })
+  Object.assign(rt, { sideNew, sideAsk, sideCancel, sideClose, sideJoin, sideDispose, sideView, onSideBackgroundWake })
 }

@@ -7,6 +7,7 @@
 // team writes them.
 import { mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { SOURCE_KIND } from './constants.js'
 import { replaceFile } from './files.js'
 import { assembleLlmStream } from './models.js'
 
@@ -152,16 +153,22 @@ export function snapshotOf(session, projections) {
 // budget: thinking shares it, so an aside must not set a small one of its own. The
 // messages array is tagged for usage. `extra` messages sit between the snapshot
 // and the prompt; a side chat's earlier finished pairs go there.
-export async function callAside(ctx, rt, snapshot, { extra = [], question, promptFor, kind, retry = false, signal, sideSessionId, entryId }) {
+export async function callAside(ctx, rt, snapshot, { extra = [], question, promptFor, kind, retry = false, signal, sideSessionId, entryId, backgroundWake = false, onProgress }) {
   const isolatedSide = typeof sideSessionId === 'string' && sideSessionId !== ''
+  const tail = isolatedSide && backgroundWake && entryId
+    ? [
+        { id: `side-q-${entryId}`, role: 'user', content: [{ type: 'text', text: promptFor(question, false) }] },
+        { id: `side-bg-${entryId}-${Date.now().toString(36)}`, role: 'user', content: [{ type: 'text', text: '[Background update]' }], source: { kind: SOURCE_KIND, form: 'relay', role: 'background' } },
+      ]
+    : [{
+        ...(isolatedSide && entryId ? { id: `side-q-${entryId}${retry ? '-retry' : ''}` } : {}),
+        role: 'user',
+        content: [{ type: 'text', text: promptFor(question, retry) }],
+      }]
   const messages = rt.tagUsage([
     ...snapshot.messages,
     ...extra,
-    {
-      ...(isolatedSide && entryId ? { id: `side-q-${entryId}${retry ? '-retry' : ''}` } : {}),
-      role: 'user',
-      content: [{ type: 'text', text: promptFor(question, retry) }],
-    },
+    ...tail,
   ], { sessionId: snapshot.sessionId, kind })
   const tools = isolatedSide ? undefined : snapshot.header?.tools
   const callOptions = {
@@ -173,7 +180,50 @@ export async function callAside(ctx, rt, snapshot, { extra = [], question, promp
     ...(isolatedSide ? { sideMainCount: snapshot.messages.length } : {}),
     signal,
   }
-  const assembler = await (rt?.assembleLlm ? rt.assembleLlm(callOptions) : assembleLlmStream(ctx, callOptions, { backoff: rt?.config?.llmRetryBackoff }))
+  let streamHooks
+  if (typeof onProgress === 'function') {
+    let textBlocks = new Map()
+    let reasonBuf = ''
+    let lastText = ''
+    let lastActivity = ''
+    const onAttempt = () => {
+      textBlocks = new Map()
+      reasonBuf = ''
+      if (lastText !== '' || lastActivity !== '') {
+        lastText = ''
+        lastActivity = ''
+        onProgress({ text: '', activity: '' })
+      }
+    }
+    const onChunk = (chunk) => {
+      if (!chunk || typeof chunk !== 'object') return
+      let changed = false
+      if (chunk.type === 'block-start' && chunk.blockType === 'text') {
+        textBlocks.set(chunk.index, '')
+      } else if (chunk.type === 'text-delta') {
+        textBlocks.set(chunk.index, (textBlocks.get(chunk.index) ?? '') + (chunk.text ?? ''))
+        changed = true
+      } else if (chunk.type === 'block-end' && chunk.block?.type === 'text') {
+        textBlocks.set(chunk.index, chunk.block.text ?? '')
+        changed = true
+      } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+        reasonBuf += chunk.text
+        changed = true
+      }
+      if (!changed) return
+      const nextText = [...textBlocks.entries()].sort((a, b) => a[0] - b[0]).map(([, part]) => part).join('\n').trim()
+      const nextActivity = reasonBuf.split('\n').map(line => line.trim()).findLast(line => line.startsWith('▸ ')) ?? ''
+      if (nextText !== lastText || nextActivity !== lastActivity) {
+        lastText = nextText
+        lastActivity = nextActivity
+        onProgress({ text: nextText, activity: nextActivity })
+      }
+    }
+    streamHooks = { onChunk, onAttempt }
+  }
+  const assembler = await (rt?.assembleLlm
+    ? rt.assembleLlm(callOptions, streamHooks)
+    : assembleLlmStream(ctx, callOptions, { backoff: rt?.config?.llmRetryBackoff, ...streamHooks }))
   const finish = assembler.finish
   if (finish.kind === 'error' || finish.kind === 'aborted') {
     return { failed: finish.failure?.message ?? finish.kind }

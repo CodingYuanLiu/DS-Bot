@@ -1253,6 +1253,7 @@ export const DE = {
   'What should change?': 'Was soll sich ändern?',
   'Note: {text}': 'Notiz: {text}',
   'Answered from progress so far; nothing was run': 'Anhand des bisherigen Fortschritts beantwortet; es wurden keine Aktionen ausgeführt',
+  'Isolated side session — runs without interrupting the main chat': 'Isolierte Nebensitzung — läuft ohne den Hauptchat zu unterbrechen',
   'Could not answer.': 'Konnte nicht antworten.',
   'Cancel this side question': 'Diese Nebenfrage abbrechen',
   Conversations: 'Chats',

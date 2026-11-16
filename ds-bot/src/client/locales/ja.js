@@ -1226,6 +1226,7 @@ export const JA = {
   "What should change?": "何を変えますか？",
   "Note: {text}": "メモ：{text}",
   "Answered from progress so far; nothing was run": "ここまでの進捗に基づく回答です（ツール実行なし）",
+  "Isolated side session — runs without interrupting the main chat": "独立したサイドセッション（メイン会話を中断せずに確認・実行可能）",
   "Could not answer.": "回答できませんでした。",
   "Cancel this side question": "このサイド質問をキャンセル",
   "Conversations": "会話",

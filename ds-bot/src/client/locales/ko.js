@@ -1253,6 +1253,7 @@ export const KO = {
   'What should change?': '무엇을 바꿀까요?',
   'Note: {text}': '메모: {text}',
   'Answered from progress so far; nothing was run': '현재까지의 진행 상황을 바탕으로 답변했으며 추가 작업은 실행되지 않았습니다',
+  'Isolated side session — runs without interrupting the main chat': '독립된 사이드 세션 — 메인 대화를 중단하지 않고 확인·실행합니다',
   'Could not answer.': '답변하지 못했습니다.',
   'Cancel this side question': '이 사이드 질문 취소',
   Conversations: '대화',

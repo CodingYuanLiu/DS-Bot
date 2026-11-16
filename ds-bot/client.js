@@ -1349,6 +1349,7 @@ var JA = {
   "What should change?": "何を変えますか？",
   "Note: {text}": "メモ：{text}",
   "Answered from progress so far; nothing was run": "ここまでの進捗に基づく回答です（ツール実行なし）",
+  "Isolated side session — runs without interrupting the main chat": "独立したサイドセッション（メイン会話を中断せずに確認・実行可能）",
   "Could not answer.": "回答できませんでした。",
   "Cancel this side question": "このサイド質問をキャンセル",
   "Conversations": "会話",
@@ -3797,6 +3798,7 @@ var KO = {
   "What should change?": "무엇을 바꿀까요?",
   "Note: {text}": "메모: {text}",
   "Answered from progress so far; nothing was run": "현재까지의 진행 상황을 바탕으로 답변했으며 추가 작업은 실행되지 않았습니다",
+  "Isolated side session — runs without interrupting the main chat": "독립된 사이드 세션 — 메인 대화를 중단하지 않고 확인·실행합니다",
   "Could not answer.": "답변하지 못했습니다.",
   "Cancel this side question": "이 사이드 질문 취소",
   Conversations: "대화",
@@ -6253,6 +6255,7 @@ var ES = {
   "What should change?": "¿Qué debe cambiar?",
   "Note: {text}": "Nota: {text}",
   "Answered from progress so far; nothing was run": "Respondido según el progreso hasta ahora; no se ejecutó nada",
+  "Isolated side session — runs without interrupting the main chat": "Sesión lateral aislada — se ejecuta sin interrumpir el chat principal",
   "Could not answer.": "No se pudo responder.",
   "Cancel this side question": "Cancelar esta pregunta lateral",
   Conversations: "Conversaciones",
@@ -8672,6 +8675,7 @@ var FR = {
   "What should change?": "Que faut-il changer ?",
   "Note: {text}": "Note : {text}",
   "Answered from progress so far; nothing was run": "Répondu à partir de l’avancement actuel ; aucune action n’a été exécutée",
+  "Isolated side session — runs without interrupting the main chat": "Session latérale isolée — s’exécute sans interrompre la discussion principale",
   "Could not answer.": "Impossible de répondre.",
   "Cancel this side question": "Annuler cette question parallèle",
   "Conversations": "Discussions",
@@ -11120,6 +11124,7 @@ var DE = {
   "What should change?": "Was soll sich ändern?",
   "Note: {text}": "Notiz: {text}",
   "Answered from progress so far; nothing was run": "Anhand des bisherigen Fortschritts beantwortet; es wurden keine Aktionen ausgeführt",
+  "Isolated side session — runs without interrupting the main chat": "Isolierte Nebensitzung — läuft ohne den Hauptchat zu unterbrechen",
   "Could not answer.": "Konnte nicht antworten.",
   "Cancel this side question": "Diese Nebenfrage abbrechen",
   Conversations: "Chats",
@@ -13572,6 +13577,7 @@ var ZH = {
   "What should change?": "要补什么？",
   "Note: {text}": "备注：{text}",
   "Answered from progress so far; nothing was run": "基于目前已有进展的回答，没有执行任何操作",
+  "Isolated side session — runs without interrupting the main chat": "独立侧边会话，可查证运行且不打断主对话",
   "Could not answer.": "没能答上。",
   "Cancel this side question": "取消这次旁路提问",
   Conversations: "对话",
@@ -38359,6 +38365,7 @@ function SideEntry({ chatId, entry, actions }) {
   const [cancelling, setCancelling] = (0, import_react55.useState)(false);
   const question = typeof entry.question === "string" ? entry.question : "";
   const answer = typeof entry.answer === "string" ? entry.answer : "";
+  const activity = typeof entry.activity === "string" ? entry.activity : "";
   const cancel = () => {
     if (cancelling || typeof actions?.cancelSide !== "function") return;
     setCancelling(true);
@@ -38372,15 +38379,20 @@ function SideEntry({ chatId, entry, actions }) {
     entry.status === "answering" ? (0, import_react55.createElement)(
       "div",
       { className: "bt-side-a" },
-      (0, import_react55.createElement)("span", { className: "bt-shimmer" }, t("Answering…")),
-      (0, import_react55.createElement)("button", {
-        type: "button",
-        className: "bt-soft bt-soft-sm",
-        disabled: cancelling,
-        title: t("Cancel this side question"),
-        "aria-label": t("Cancel this side question"),
-        onClick: cancel
-      }, t("Cancel"))
+      answer !== "" ? (0, import_react55.createElement)(import_dsh_client_ui_primitives.MarkdownText, { text: answer, labels: mdLabels(), variant: "compact" }) : null,
+      (0, import_react55.createElement)(
+        "div",
+        { className: "bt-side-live" },
+        (0, import_react55.createElement)("span", { className: "bt-shimmer bt-side-step", ...activity !== "" ? { title: activity } : {} }, activity !== "" ? activity : t("Answering…")),
+        (0, import_react55.createElement)("button", {
+          type: "button",
+          className: "bt-soft bt-soft-sm",
+          disabled: cancelling,
+          title: t("Cancel this side question"),
+          "aria-label": t("Cancel this side question"),
+          onClick: cancel
+        }, t("Cancel"))
+      )
     ) : (0, import_react55.createElement)(
       "div",
       { className: "bt-side-a" },
@@ -38397,10 +38409,11 @@ function SideChatView({ subject, chat, roster, actions }) {
   const entries2 = Array.isArray(chat?.entries) ? chat.entries : [];
   const busy = entries2.some((entry) => entry?.status === "answering");
   const last = entries2.at(-1);
+  const localSide = Boolean(roster?.byId?.[subject]?.engine);
   (0, import_react55.useEffect)(() => {
     const node = scroll.current;
     if (node) node.scrollTop = node.scrollHeight;
-  }, [chat?.id, entries2.length, last?.status]);
+  }, [chat?.id, entries2.length, last?.status, last?.answer, last?.activity]);
   if (!chat) return null;
   const ask = () => {
     const text = draft.trim();
@@ -38415,7 +38428,7 @@ function SideChatView({ subject, chat, roster, actions }) {
   return (0, import_react55.createElement)(
     "div",
     { className: "bt-side" },
-    (0, import_react55.createElement)("p", { className: "bt-side-note" }, t("Answered from progress so far; nothing was run")),
+    (0, import_react55.createElement)("p", { className: "bt-side-note" }, localSide ? t("Isolated side session — runs without interrupting the main chat") : t("Answered from progress so far; nothing was run")),
     (0, import_react55.createElement)(
       "div",
       { className: "bt-side-scroll", ref: scroll },
@@ -38508,7 +38521,9 @@ var SIDE_CSS = `
 .bt-side-pair{display:flex;flex-direction:column;gap:8px}
 .bt-side-qrow{display:flex;justify-content:flex-end}
 .bt-side-q{max-width:85%;padding:7px 12px;border-radius:18px;background:var(--bt-user);color:var(--bt-user-ink);font-size:13px;line-height:19px;box-sizing:border-box;overflow-wrap:anywhere;white-space:pre-wrap}
-.bt-side-a{display:flex;flex-direction:column;gap:8px;align-items:flex-start;font-size:13px;line-height:19px;color:var(--bt-ink)}
+.bt-side-a{display:flex;flex-direction:column;gap:8px;align-items:flex-start;min-width:0;max-width:100%;font-size:13px;line-height:19px;color:var(--bt-ink)}
+.bt-side-live{display:flex;flex-wrap:wrap;align-items:center;gap:8px;max-width:100%}
+.bt-side-step{max-width:100%;font-size:12px;line-height:17px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bt-side-status{margin:0;font-size:12px;color:var(--bt-ink-3)}
 .bt-side-fail{margin:0;font-size:12px;line-height:17px;color:var(--bt-danger)}
 .bt-side-form{flex:none;padding:10px 14px 14px;border-top:.5px solid var(--bt-line);display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px}

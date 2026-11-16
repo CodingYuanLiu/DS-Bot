@@ -65,16 +65,20 @@ function canRetryPolicy(policy, code, retry) {
 // bypass the agent loop's `agent/request-error` hook, so `dsh-llm-retry` never sees
 // their transport or stream-idle failures. Retry those transient codes on the same
 // route with the provider's own retry policy, discarding partial chunks from failed attempts.
-export async function assembleLlmStream(ctx, options, { signal, backoff, random = Math.random } = {}) {
+export async function assembleLlmStream(ctx, options, { signal, backoff, random = Math.random, onChunk, onAttempt } = {}) {
   const service = serviceOf(ctx, 'llm')
   if (service === undefined) throw Object.assign(new Error('DS Bot is shutting down'), { code: 'ABORTED', failure: { code: 'ABORTED', message: 'DS Bot is shutting down' } })
   const fused = options.signal && signal ? AbortSignal.any([options.signal, signal]) : (options.signal ?? signal)
   const request = fused === options.signal ? options : { ...options, signal: fused }
   for (let retry = 1; ; retry += 1) {
+    onAttempt?.(retry)
     const assembler = new BlockAssembler()
     let thrown
     try {
-      for await (const chunk of service.stream(request)) assembler.push(chunk)
+      for await (const chunk of service.stream(request)) {
+        assembler.push(chunk)
+        onChunk?.(chunk)
+      }
     } catch (error) {
       thrown = error
     }
@@ -441,7 +445,7 @@ export function install(rt) {
 
   const lifetime = new AbortController()
   ctx.effect?.(() => () => { closing = true; lifetime.abort() }, 'ds-bot: auxiliary llm retry')
-  const assembleLlm = options => assembleLlmStream(ctx, options, { signal: lifetime.signal, backoff: rt.config?.llmRetryBackoff })
+  const assembleLlm = (options, extra) => assembleLlmStream(ctx, options, { signal: lifetime.signal, backoff: rt.config?.llmRetryBackoff, ...extra })
 
   Object.assign(rt, {
     // Work that starts while the host runs can ask whether the host is still there.

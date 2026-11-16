@@ -1253,6 +1253,7 @@ export const ES = {
   'What should change?': '¿Qué debe cambiar?',
   'Note: {text}': 'Nota: {text}',
   'Answered from progress so far; nothing was run': 'Respondido según el progreso hasta ahora; no se ejecutó nada',
+  'Isolated side session — runs without interrupting the main chat': 'Sesión lateral aislada — se ejecuta sin interrumpir el chat principal',
   'Could not answer.': 'No se pudo responder.',
   'Cancel this side question': 'Cancelar esta pregunta lateral',
   Conversations: 'Conversaciones',

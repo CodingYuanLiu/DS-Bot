@@ -16,6 +16,7 @@ function SideEntry({ chatId, entry, actions }) {
   const [cancelling, setCancelling] = useState(false)
   const question = typeof entry.question === 'string' ? entry.question : ''
   const answer = typeof entry.answer === 'string' ? entry.answer : ''
+  const activity = typeof entry.activity === 'string' ? entry.activity : ''
   const cancel = () => {
     if (cancelling || typeof actions?.cancelSide !== 'function') return
     setCancelling(true)
@@ -25,11 +26,13 @@ function SideEntry({ chatId, entry, actions }) {
     h('div', { className: 'bt-side-qrow' }, h('div', { className: 'bt-side-q' }, question)),
     entry.status === 'answering'
       ? h('div', { className: 'bt-side-a' },
-          h('span', { className: 'bt-shimmer' }, t('Answering…')),
-          h('button', {
-            type: 'button', className: 'bt-soft bt-soft-sm', disabled: cancelling,
-            title: t('Cancel this side question'), 'aria-label': t('Cancel this side question'), onClick: cancel,
-          }, t('Cancel')))
+          answer !== '' ? h(MarkdownText, { text: answer, labels: mdLabels(), variant: 'compact' }) : null,
+          h('div', { className: 'bt-side-live' },
+            h('span', { className: 'bt-shimmer bt-side-step', ...(activity !== '' ? { title: activity } : {}) }, activity !== '' ? activity : t('Answering…')),
+            h('button', {
+              type: 'button', className: 'bt-soft bt-soft-sm', disabled: cancelling,
+              title: t('Cancel this side question'), 'aria-label': t('Cancel this side question'), onClick: cancel,
+            }, t('Cancel'))))
       : h('div', { className: 'bt-side-a' },
           entry.status === 'cancelled' ? h('p', { className: 'bt-side-status' }, t('Cancelled')) : null,
           entry.status === 'failed' ? h('p', { className: 'bt-side-fail' }, failureText(entry)) : null,
@@ -43,10 +46,11 @@ export function SideChatView({ subject, chat, roster, actions }) {
   const entries = Array.isArray(chat?.entries) ? chat.entries : []
   const busy = entries.some(entry => entry?.status === 'answering')
   const last = entries.at(-1)
+  const localSide = Boolean(roster?.byId?.[subject]?.engine)
   useEffect(() => {
     const node = scroll.current
     if (node) node.scrollTop = node.scrollHeight
-  }, [chat?.id, entries.length, last?.status])
+  }, [chat?.id, entries.length, last?.status, last?.answer, last?.activity])
   if (!chat) return null
   const ask = () => {
     const text = draft.trim()
@@ -60,7 +64,9 @@ export function SideChatView({ subject, chat, roster, actions }) {
     })
   }
   return h('div', { className: 'bt-side' },
-    h('p', { className: 'bt-side-note' }, t('Answered from progress so far; nothing was run')),
+    h('p', { className: 'bt-side-note' }, localSide
+      ? t('Isolated side session — runs without interrupting the main chat')
+      : t('Answered from progress so far; nothing was run')),
     h('div', { className: 'bt-side-scroll', ref: scroll },
       entries.map(entry => h(SideEntry, { key: entry.id, chatId: chat.id, entry, actions }))),
     h('div', { className: 'bt-side-form' },
@@ -137,7 +143,9 @@ export const SIDE_CSS = `
 .bt-side-pair{display:flex;flex-direction:column;gap:8px}
 .bt-side-qrow{display:flex;justify-content:flex-end}
 .bt-side-q{max-width:85%;padding:7px 12px;border-radius:18px;background:var(--bt-user);color:var(--bt-user-ink);font-size:13px;line-height:19px;box-sizing:border-box;overflow-wrap:anywhere;white-space:pre-wrap}
-.bt-side-a{display:flex;flex-direction:column;gap:8px;align-items:flex-start;font-size:13px;line-height:19px;color:var(--bt-ink)}
+.bt-side-a{display:flex;flex-direction:column;gap:8px;align-items:flex-start;min-width:0;max-width:100%;font-size:13px;line-height:19px;color:var(--bt-ink)}
+.bt-side-live{display:flex;flex-wrap:wrap;align-items:center;gap:8px;max-width:100%}
+.bt-side-step{max-width:100%;font-size:12px;line-height:17px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bt-side-status{margin:0;font-size:12px;color:var(--bt-ink-3)}
 .bt-side-fail{margin:0;font-size:12px;line-height:17px;color:var(--bt-danger)}
 .bt-side-form{flex:none;padding:10px 14px 14px;border-top:.5px solid var(--bt-line);display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px}

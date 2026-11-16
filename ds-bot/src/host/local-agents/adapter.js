@@ -491,7 +491,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     await this.closeLive(live, { idle: true })
   }
 
-  // Closing a Side Chat tab releases its isolated read-only CLI session immediately
+  // Closing a Side Chat tab releases its isolated CLI session immediately
   // (`session/close`) without touching the Bot's main CLI session or worker.
   async closeSideSession(sessionId) {
     const id = String(sessionId)
@@ -503,6 +503,23 @@ export class LocalAgentAdapter extends LlmAdapter {
       await live.engine.closeSession?.(live.engineSession).catch(() => {})
     }
     await this.closeLive(live)
+  }
+
+  isSideSessionBusy(sessionId) {
+    const live = this.live.get(String(sessionId))
+    return live !== undefined && !live.dead && live.engineSession?.dead !== true
+      && (live.cliFullyIdle === false || live.background === true)
+  }
+
+  hasSideSessionBackground(sessionId) {
+    const live = this.live.get(String(sessionId))
+    return live !== undefined && !live.dead && live.engineSession?.dead !== true && live.background === true
+  }
+
+  cancelSideTurn(sessionId, reason = 'the side question was cancelled') {
+    const live = this.live.get(String(sessionId))
+    if (live === undefined || live.dead) return
+    this.stopTurn(live, reason)
   }
 
   // A Claude CLI that died before `system/init` never read the prompt it was
@@ -679,7 +696,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     const resolveImage = block => this.resolveImageBlock(block, { supportsImages, signal: options.signal })
     const backgroundOnly = !fresh && remaining.length === 0 && !answeredOpenCall && (live.background || hasBackgroundWake)
     if (backgroundOnly && !live.background && live.events.length === 0 && !resolvedTool) {
-      const last = messages.at(-1)
+      const last = sideSession ? messages.findLast(message => !isBackgroundWake(message)) : messages.at(-1)
       if (last !== undefined) {
         live.handedBefore = live.handed
         live.handed = last.id
@@ -775,7 +792,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     // The last DSH message is handed now; a later call sends only what follows.
     // The marker before it is kept: a start that fails before the CLI reads
     // anything must not count that message as delivered.
-    const last = messages.at(-1)
+    const last = sideSession ? messages.findLast(message => !isBackgroundWake(message)) : messages.at(-1)
     if (last !== undefined) {
       live.handedBefore = live.handed
       live.handed = last.id
@@ -1094,14 +1111,16 @@ export class LocalAgentAdapter extends LlmAdapter {
           return
         }
         case 'permission': {
-          if (isSideSession(live.sessionId)) {
-            event.reply(event.changes === true ? (optionOf(event.options, 'reject') ?? null) : (optionOf(event.options, 'allow') ?? null))
-            break
-          }
           // The preset answers what it already decides, also on an agent with no
           // matching mode of its own: full access allows, read-only refuses a change.
           const answer = presetAnswer(this.deps.presetFor(live.sessionId), event)
           if (answer !== undefined) { event.reply(answer); break }
+          // Side chats have no approval card: read-only prompts are allowed, while
+          // unapproved changes under workspace-write fail closed instead of suspending.
+          if (isSideSession(live.sessionId)) {
+            event.reply(event.changes === true ? (optionOf(event.options, 'reject') ?? null) : (optionOf(event.options, 'allow') ?? null))
+            break
+          }
           yield* closeBlocks()
           live.state = 'suspended'
           // The CLI's own permission prompt, bridged as an approval tool call.

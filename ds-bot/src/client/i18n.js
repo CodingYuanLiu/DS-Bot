@@ -1260,6 +1260,7 @@ const ZH = {
   'What should change?': '要补什么？',
   'Note: {text}': '备注：{text}',
   'Answered from progress so far; nothing was run': '基于目前已有进展的回答，没有执行任何操作',
+  'Isolated side session — runs without interrupting the main chat': '独立侧边会话，可查证运行且不打断主对话',
   'Could not answer.': '没能答上。',
   'Cancel this side question': '取消这次旁路提问',
   Conversations: '对话',
