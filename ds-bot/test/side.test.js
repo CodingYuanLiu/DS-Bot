@@ -701,8 +701,12 @@ test('local-agent /side runs concurrently in an isolated read-only session witho
   const sessions = new Map([[session.id, session]])
 
   const adapters = new Map()
-  const services = {}
+  const services = { agents: new Map() }
   const ctx = fakeContext({ services })
+  Object.defineProperty(ctx, 'agents', {
+    configurable: true,
+    get() { throw new Error('cannot get property "agents" without inject') },
+  })
   services.sessionProjections = projectionRegistry(ctx)
   ctx.llm = {
     registerAdapter(routes, adapter) {

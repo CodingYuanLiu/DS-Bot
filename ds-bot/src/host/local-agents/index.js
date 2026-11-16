@@ -81,8 +81,8 @@ export function install(rt) {
     return { available: supported(), detected: detected(), custom: customView() }
   }
 
-  const liveAgent = sessionId => ctx.get?.('agents')?.get(sessionId) ?? ctx.agents?.get?.(sessionId)
   const isSideSession = sessionId => typeof sessionId === 'string' && sessionId.startsWith('side:')
+  const liveAgent = sessionId => (isSideSession(sessionId) ? undefined : serviceOf(ctx, 'agents')?.get?.(sessionId))
   // Ephemeral side-chat sessions (`side:<chatId>`) stay purely in memory so they
   // never pollute `state.localAgents.sessions` or block the Bot's main session.
   const sideRecords = new Map()
@@ -152,6 +152,7 @@ export function install(rt) {
       rt.noteCliWork?.(sessionId, stepTexts)
     },
     onBackgroundWake: async (sessionId) => {
+      if (isSideSession(sessionId)) return false
       const agent = await rt.resolveAgent(sessionId).catch(() => undefined)
       if (typeof agent?.followup !== 'function') return false
       const already = (agent.inbox?.nextTurn ?? []).some(msg => msg?.source?.kind === SOURCE_KIND && msg.source.role === 'background')

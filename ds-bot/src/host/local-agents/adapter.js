@@ -108,7 +108,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     const live = this.liveByCliSession(route, cliSessionId)
     if (live === undefined) return []
     const items = live.steerQueue.splice(0)
-    if (live.state === 'running') {
+    if (live.state === 'running' && !isSideSession(live.sessionId)) {
       const inboxItems = this.deps.peekInboxSteers?.(live.sessionId, live.steeredIds) ?? []
       if (inboxItems.length > 0) {
         for (const item of inboxItems) {
@@ -126,7 +126,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     const live = this.liveByCliSession(route, cliSessionId)
     if (live === undefined) return false
     if (live.steerQueue.length > 0) return true
-    if (live.state === 'running') {
+    if (live.state === 'running' && !isSideSession(live.sessionId)) {
       return (this.deps.peekInboxSteers?.(live.sessionId, live.steeredIds)?.length ?? 0) > 0
     }
     return false
@@ -138,7 +138,9 @@ export class LocalAgentAdapter extends LlmAdapter {
   }
 
   markSteerPending(sessionId) {
-    const live = this.live.get(String(sessionId))
+    const id = String(sessionId)
+    if (isSideSession(id)) return
+    const live = this.live.get(id)
     if (live === undefined || live.dead || live.spec.hookSteer !== true) return
     const cliSessionId = live.engineSession?.acpSessionId ?? live.cliSessionId
     if (cliSessionId !== undefined) {
