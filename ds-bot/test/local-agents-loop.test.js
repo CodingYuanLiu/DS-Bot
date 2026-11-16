@@ -27,7 +27,7 @@ function makeAdapter(ctx, records = {}, extra = {}) {
     findExecutable: path => path,
     spawnEngine: (kind, route, spec, hooks = {}) => new AcpEngine(
       route,
-      { ...spec, command: process.execPath, args: [FIXTURE, ...(route === 'local-antigravity' ? ['--agy'] : [])] },
+      { ...spec, command: process.execPath, args: [FIXTURE, ...(route === 'local-antigravity' ? ['--agy', '--thought-levels'] : [])] },
       { findExecutable: path => path, agyHomeDir, ...hooks },
     ),
     record: sessionId => records[sessionId],
@@ -240,4 +240,23 @@ test('antigravity hook steer injects mid-turn user input at PostInvocation and S
   agent.steer(createUserMessage({ content: [{ type: 'text', text: 'check edge cases too' }], source: { kind: 'user' } }))
   await done2
   assert.match(texts(agent), /stop-steered: check edge cases too/)
+})
+
+test('real DSH loop accepts reasoningEffort on a cold local-antigravity adapter without UNSUPPORTED_REASONING_EFFORT', async (t) => {
+  const ctx = new Context()
+  await mountAgentLoopTestDependencies(ctx)
+  const adapter = makeAdapter(ctx)
+  ctx.llm.registerAdapter(['local-antigravity'], adapter)
+  await mountAgentLoopTestHarness(ctx)
+  const agent = await ctx.agentLoop.create(SessionId('s-effort'), {
+    provider: 'local-antigravity',
+    model: 'fake-large',
+    reasoningEffort: 'medium',
+  })
+  t.after(async () => { await adapter.dispose(); await ctx.fiber.dispose() })
+
+  send(agent, 'show-state')
+  await waitForIdle(ctx, agent)
+  assert.equal(agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')?.data.reason.kind, 'completed')
+  assert.match(texts(agent), /effort: medium/)
 })

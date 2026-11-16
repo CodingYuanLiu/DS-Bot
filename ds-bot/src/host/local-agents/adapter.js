@@ -172,11 +172,21 @@ export class LocalAgentAdapter extends LlmAdapter {
     live.push({ type: 'steered' })
   }
 
+  knownModels(route) {
+    if (this.modelCache.has(route)) return this.modelCache.get(route)
+    const saved = this.deps.cachedModels?.(route)
+    if (Array.isArray(saved) && saved.length > 0) {
+      this.modelCache.set(route, saved)
+      return saved
+    }
+    return undefined
+  }
+
   // What DS Bot knows of a route without starting its CLI: the CLI's default, what a
   // probe found, and what a Bot runs on. DSH and the catalog ask this for every route.
   async listModels(route) {
     if (engineOf(route, this.deps.customAgents()) === undefined) return []
-    const listed = [{ provider: route, id: 'default', name: 'CLI default' }, ...(this.modelCache.get(route) ?? [])]
+    const listed = [{ provider: route, id: 'default', name: 'CLI default' }, ...(this.knownModels(route) ?? [])]
     const used = (this.deps.usedModels?.(route) ?? []).filter(id => !listed.some(model => model.id === id))
     return [...listed, ...used.map(id => ({ provider: route, id, name: id }))]
   }
@@ -184,7 +194,7 @@ export class LocalAgentAdapter extends LlmAdapter {
   // Asks one CLI what it serves, once. A failure is not kept, so the next look tries
   // again. The process it took leaves unless a Session runs on it.
   async probeModels(route) {
-    if (this.modelCache.has(route)) return this.listModels(route)
+    if (this.knownModels(route) !== undefined) return this.listModels(route)
     if (engineOf(route, this.deps.customAgents()) === undefined) return []
     let probe = this.probes.get(route)
     if (probe === undefined) {
@@ -199,8 +209,10 @@ export class LocalAgentAdapter extends LlmAdapter {
     const engine = this.engine(route)
     try {
       const models = await engine.listModels({ cwd: this.deps.probeCwd(), mcp: undefined })
-      this.modelCache.set(route, (models ?? []).filter(model => model.id !== 'default')
-        .map(model => ({ provider: route, id: model.id, name: model.name ?? model.id, ...(model.reasoning ? { reasoning: model.reasoning } : {}) })))
+      const cached = (models ?? []).filter(model => model.id !== 'default')
+        .map(model => ({ provider: route, id: model.id, name: model.name ?? model.id, ...(model.reasoning ? { reasoning: model.reasoning } : {}) }))
+      this.modelCache.set(route, cached)
+      if (cached.length > 0) this.deps.saveModels?.(route, cached)
     } catch { /* the menu still has the CLI's default */ }
     if (!this.engineInUse(engine)) await engine.close?.().catch(() => {})
   }
@@ -208,10 +220,14 @@ export class LocalAgentAdapter extends LlmAdapter {
   dropModelCache(route) {
     if (route === undefined) this.modelCache.clear()
     else this.modelCache.delete(route)
+    this.deps.dropModels?.(route)
   }
 
   async resolveModel(route, model) {
     const spec = engineOf(route, this.deps.customAgents())
+    if (spec !== undefined && model !== 'default' && this.knownModels(route) === undefined) {
+      await this.probeModels(route).catch(() => {})
+    }
     const listed = (await this.listModels(route).catch(() => [])).find(entry => entry.id === model)
     const supportsImage = spec?.kind !== 'acp' || this.engines.get(route)?.supportsImages?.() !== false
     return {

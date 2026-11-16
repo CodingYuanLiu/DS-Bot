@@ -2029,3 +2029,45 @@ test('Stop hook fullyIdle:false protects long in-process agy subagents from 10-m
   assert.equal(live.dead, true)
   assert.equal(adapter.live.has('s1'), false)
 })
+
+test('resolveModel auto-probes named models on a cold cache and reuses persisted models across restarts without spawning', async (t) => {
+  const savedModels = {}
+  const makePersistedAdapter = () => {
+    const spawned = []
+    const adapter = new LocalAgentAdapter({
+      rt: { warn: () => {} },
+      customAgents: () => [],
+      findExecutable: path => path,
+      spawnEngine: (_kind, route, spec, hooks = {}) => {
+        const engine = new AcpEngine(route, { ...spec, command: process.execPath, args: [FIXTURES.acp, '--agy', '--thought-levels'] }, { findExecutable: path => path, agyHomeDir: false, ...hooks })
+        spawned.push(engine)
+        return engine
+      },
+      cachedModels: route => savedModels[route],
+      saveModels: (route, models) => { savedModels[route] = models },
+      dropModels: (route) => { if (route === undefined) for (const k of Object.keys(savedModels)) delete savedModels[k]; else delete savedModels[route] },
+      record: () => undefined,
+      saveRecord: () => {},
+      presetFor: () => 'workspace-write',
+      cwdFor: async () => mkdtempSync(join(tmpdir(), 'dsb-cwd-')),
+      probeCwd: () => mkdtempSync(join(tmpdir(), 'dsb-probe-')),
+      toolsFor: () => [],
+    })
+    adapter._spawned = spawned
+    return adapter
+  }
+
+  // 1. Cold boot with empty savedModels: resolveModel for 'fake-large' auto-probes and persists efforts.
+  const first = makePersistedAdapter()
+  t.after(() => first.dispose())
+  const info1 = await first.resolveModel('local-antigravity', 'fake-large')
+  assert.deepEqual(info1.reasoning?.efforts?.map(e => e.id), ['low', 'medium', 'high', 'xhigh'])
+  assert.ok(Array.isArray(savedModels['local-antigravity']) && savedModels['local-antigravity'].length > 0)
+
+  // 2. Simulated restart: second adapter reads savedModels immediately with 0 spawned processes!
+  const second = makePersistedAdapter()
+  t.after(() => second.dispose())
+  const info2 = await second.resolveModel('local-antigravity', 'fake-large')
+  assert.deepEqual(info2.reasoning?.efforts?.map(e => e.id), ['low', 'medium', 'high', 'xhigh'])
+  assert.equal(second._spawned.length, 0, 'persisted model cache resolves reasoning efforts across restarts without spawning')
+})

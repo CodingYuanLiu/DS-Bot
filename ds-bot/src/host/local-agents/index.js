@@ -33,9 +33,10 @@ export function install(rt) {
   // state.localAgents is replaced by the state load after install; read it
   // each time instead of holding the pre-load object.
   const store = () => {
-    const live = state.localAgents ??= { custom: [], sessions: {} }
+    const live = state.localAgents ??= { custom: [], sessions: {}, models: {} }
     live.custom ??= []
     live.sessions ??= {}
+    live.models ??= {}
     return live
   }
 
@@ -93,6 +94,16 @@ export function install(rt) {
     findExecutable,
     spawnEngine,
     usedModels: route => usedRefs().map(ref => splitRef(ref)).filter(used => used?.provider === route).map(used => used.model),
+    cachedModels: route => store().models[route],
+    saveModels: (route, models) => {
+      store().models[route] = models
+      void rt.save().catch(() => {})
+    },
+    dropModels: (route) => {
+      if (route === undefined) store().models = {}
+      else delete store().models[route]
+      void rt.save().catch(() => {})
+    },
     record: sessionId => (isSideSession(sessionId) ? sideRecords.get(sessionId) : store().sessions[sessionId]),
     saveRecord: (sessionId, record) => {
       if (isSideSession(sessionId)) { sideRecords.set(sessionId, record); return }
