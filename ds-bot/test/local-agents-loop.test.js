@@ -260,3 +260,55 @@ test('real DSH loop accepts reasoningEffort on a cold local-antigravity adapter 
   assert.equal(agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')?.data.reason.kind, 'completed')
   assert.match(texts(agent), /effort: medium/)
 })
+
+test('antigravity Stop hook + transcriptPath delivers idle subagent wakeup without stdout session/update or duplicate Turn 1 text', { skip: process.platform === 'win32' }, async (t) => {
+  const ctx = new Context()
+  await mountAgentLoopTestDependencies(ctx)
+  let agentRef
+  const adapter = makeAdapter(ctx, {}, {
+    onBackgroundWake: async () => {
+      if (!agentRef) return false
+      const already = (agentRef.inbox?.nextTurn ?? []).some(msg => msg?.source?.kind === 'bot' && msg.source.role === 'background')
+      if (!already) {
+        agentRef.followup(createUserMessage({
+          content: [{ type: 'text', text: '[Background update]' }],
+          source: { kind: 'bot', form: 'relay', role: 'background' },
+        }))
+      }
+      await ctx.sessions.flush(agentRef.session)
+      return true
+    },
+  })
+  ctx.llm.registerAdapter(['local-antigravity'], adapter)
+  await mountAgentLoopTestHarness(ctx)
+  const agent = await ctx.agentLoop.create(SessionId('s-transcript-bg'), {
+    provider: 'local-antigravity',
+    model: 'default',
+  })
+  agentRef = agent
+  const logDir = mkdtempSync(join(tmpdir(), 'dsb-agy-transcript-'))
+  t.after(async () => {
+    await adapter.dispose()
+    await ctx.fiber.dispose()
+    rmSync(logDir, { recursive: true, force: true })
+  })
+
+  const secondTurnDone = new Promise((resolve) => {
+    let idleCount = 0
+    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
+      if (subject === agent && status === 'idle') {
+        idleCount += 1
+        if (idleCount >= 2) { dispose(); resolve() }
+      }
+    })
+  })
+  send(agent, `transcript-bg-wakeup:${logDir}`)
+  await secondTurnDone
+
+  const assistantTexts = agent.session.snapshotEvents()
+    .filter(event => event.type === 'assistant/message')
+    .map(event => (event.data?.message?.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('\n'))
+  assert.equal(assistantTexts.length, 2)
+  assert.equal(assistantTexts[0], 'Subagent dispatched in Turn 1.')
+  assert.equal(assistantTexts[1], 'Full subagent report from transcript_full.jsonl!')
+})

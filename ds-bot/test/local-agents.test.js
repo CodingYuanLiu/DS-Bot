@@ -13,7 +13,7 @@ import { ClaudeEngine } from '../src/host/local-agents/claude.js'
 import { LoopbackMcp, flattenSchema } from '../src/host/local-agents/mcp.js'
 import { cleanEnv } from '../src/host/local-agents/discover.js'
 import { ENGINES, canSteerEngine, validateCustom, isLocalAgentRoute, cliMode, acpMode } from '../src/host/local-agents/engines.js'
-import { AgySteerServer, ensureAgySteerPlugin, postAgySteer } from '../src/host/local-agents/agy-steer.js'
+import { AgySteerServer, ensureAgySteerPlugin, postAgySteer, readAgyTranscriptWakeup, readAgyTranscriptWatermark } from '../src/host/local-agents/agy-steer.js'
 import { install as localAgentsInstall } from '../src/host/local-agents/index.js'
 import { AGENT_BADGES, agentAvatar, badgeOf, isLocalRoute } from '../src/client/agent-routes.js'
 import { stripHeader } from '../src/client/text.js'
@@ -2070,4 +2070,147 @@ test('resolveModel auto-probes named models on a cold cache and reuses persisted
   const info2 = await second.resolveModel('local-antigravity', 'fake-large')
   assert.deepEqual(info2.reasoning?.efforts?.map(e => e.id), ['low', 'medium', 'high', 'xhigh'])
   assert.equal(second._spawned.length, 0, 'persisted model cache resolves reasoning efforts across restarts without spawning')
+})
+
+test('transcript watermark and hydration handle >64KiB partial records, >2MiB full records, delayed full flushes, consecutive wakes, mixed stdout+transcript, and USER_CANCELED', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-transcript-edges-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const compactPath = join(dir, 'transcript.jsonl')
+  const fullPath = join(dir, 'transcript_full.jsonl')
+
+  // 1. >64 KiB partial JSONL line must never anchor mid-record.
+  const step0 = `${JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'initial ok' })}\n`
+  const longText = 'A'.repeat(70_000)
+  const step1Full = JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: longText })
+  writeFileSync(compactPath, step0 + step1Full.slice(0, 70_000), 'utf8')
+  const mark0 = readAgyTranscriptWatermark(compactPath)
+  assert.equal(mark0.maxStepIndex, 0)
+  assert.equal(mark0.byteOffset, Buffer.byteLength(step0), 'watermark stays at exact boundary before 70KB partial record')
+
+  writeFileSync(compactPath, `${step0}${step1Full}\n`, 'utf8')
+  const wake1 = readAgyTranscriptWakeup(compactPath, mark0)
+  assert.equal(wake1.events.length, 1)
+  assert.equal(wake1.events[0].text, longText)
+
+  // 2. Delayed hydration + >2 MiB full record in transcript_full.jsonl.
+  const step2Compact = `${JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'TRUNCATED', truncated_fields: ['content'] })}\n`
+  writeFileSync(compactPath, `${step0}${step1Full}\n${step2Compact}`, 'utf8')
+  const pendingWake = readAgyTranscriptWakeup(compactPath, wake1.watermark)
+  assert.equal(pendingWake.unresolvedTruncated, true, 'retains unresolved truncated step when transcript_full.jsonl is not flushed yet')
+  assert.equal(pendingWake.events.length, 0)
+  assert.equal(pendingWake.watermark.maxStepIndex, 1)
+
+  const overTwoMiB = 'B'.repeat(2_200_000)
+  writeFileSync(fullPath, `${JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', content: overTwoMiB })}\n`, 'utf8')
+  const hydratedWake = readAgyTranscriptWakeup(compactPath, pendingWake.watermark)
+  assert.equal(hydratedWake.unresolvedTruncated, false)
+  assert.equal(hydratedWake.events.length, 1)
+  assert.equal(hydratedWake.events[0].text.length, 2_200_000)
+
+  // 3. Consecutive background Stop hooks coalesce without stranding batches, mixed stdout+transcript reconciles, and USER_CANCELED is suppressed.
+  let wokeCount = 0
+  const adapter = makeAdapter({
+    acpArgs: ['--agy'],
+    onBackgroundWake: async () => { wokeCount += 1; return true },
+  })
+  t.after(() => adapter.dispose())
+
+  await collect(adapter.stream(options('s-edge', [user('m1', 'hello')], { provider: 'local-antigravity' })))
+  const live = adapter.live.get('s-edge')
+  const sessionLog = join(dir, 'live-transcript.jsonl')
+  const turn1Line = `${JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'ok: hello' })}\n`
+  writeFileSync(sessionLog, turn1Line, 'utf8')
+  live.transcriptWatermark = readAgyTranscriptWatermark(sessionLog)
+
+  // Mixed stdout activity + transcript-only final text across two consecutive Stop hooks before draining!
+  live.bgStdoutActivities = 1
+  live.push({ type: 'activity', text: '▸ run_command' })
+  const wakeBatch1 = `${JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'first subagent finished' })}\n`
+  writeFileSync(sessionLog, turn1Line + wakeBatch1, 'utf8')
+  await adapter.noteHookStopState('local-antigravity', live.cliSessionId, false, sessionLog, 'NO_TOOL_CALL')
+
+  const wakeBatch2 = `${JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'second subagent finished' })}\n`
+  writeFileSync(sessionLog, turn1Line + wakeBatch1 + wakeBatch2, 'utf8')
+  await adapter.noteHookStopState('local-antigravity', live.cliSessionId, true, sessionLog, 'NO_TOOL_CALL')
+
+  const bgMsg = { id: 'bg-1', role: 'user', content: [{ type: 'text', text: '[Background update]' }], source: { kind: 'bot', form: 'relay', role: 'background' } }
+  const coalesced = await collect(adapter.stream(options('s-edge', [user('m1', 'hello'), bgMsg], { provider: 'local-antigravity' })))
+  assert.equal(coalesced.text, 'first subagent finished\n\nsecond subagent finished')
+  assert.equal(live.background, false)
+  assert.equal(live.events.length, 0, 'no stranded events left behind for subsequent questions')
+
+  // USER_CANCELED Stop hook advances watermark without queuing a bogus background wake.
+  const wakeCountBeforeCancel = wokeCount
+  const cancelledLine = `${JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'cancelled partial' })}\n`
+  writeFileSync(sessionLog, turn1Line + wakeBatch1 + wakeBatch2 + cancelledLine, 'utf8')
+  await adapter.noteHookStopState('local-antigravity', live.cliSessionId, true, sessionLog, 'USER_CANCELED')
+  assert.equal(wokeCount, wakeCountBeforeCancel)
+  assert.equal(live.background, false)
+  assert.equal(live.transcriptWatermark?.maxStepIndex, 3)
+})
+
+test('side session reopens cleanly with full snapshot replay when main cwd or permission preset changes', async (t) => {
+  let currentCwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsb-side-cwd1-')))
+  const nextCwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsb-side-cwd2-')))
+  let currentPreset = 'read-only'
+  const sideRecords = new Map()
+  const adapter = new LocalAgentAdapter({
+    rt: { warn: () => {} },
+    customAgents: () => [],
+    findExecutable: path => path,
+    spawnEngine: (_kind, route, spec, hooks = {}) => new AcpEngine(route, { ...spec, command: process.execPath, args: [FIXTURES.acp, '--agy'] }, { findExecutable: path => path, agyHomeDir: false, ...hooks }),
+    record: id => sideRecords.get(id),
+    saveRecord: (id, rec) => sideRecords.set(id, rec),
+    dropRecord: id => sideRecords.delete(id),
+    presetFor: () => currentPreset,
+    cwdFor: async () => currentCwd,
+    probeCwd: () => currentCwd,
+    toolsFor: () => [],
+  })
+  t.after(async () => {
+    await adapter.dispose()
+    rmSync(currentCwd, { recursive: true, force: true })
+    rmSync(nextCwd, { recursive: true, force: true })
+  })
+
+  const mainMsg = user('main-1', 'Main context anchor line')
+  const q1 = user('side-q-1', 'side-inspect initial')
+  const r1 = await collect(adapter.stream({
+    provider: 'local-antigravity',
+    model: 'default',
+    sessionId: 'side:c1',
+    sideMainCount: 1,
+    messages: [mainMsg, q1],
+  }))
+  assert.match(r1.text, new RegExp(`cwd=${currentCwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+  assert.match(r1.text, /readOk=true execOk=false/)
+
+  // 1. Permission preset upgrades to danger-full-access -> reopens side session AND preserves main snapshot!
+  currentPreset = 'danger-full-access'
+  const a1 = { id: 'side-a-1', role: 'assistant', content: [{ type: 'text', text: 'First side answer' }] }
+  const q2 = user('side-q-2', 'side-inspect after-preset-change')
+  const r2 = await collect(adapter.stream({
+    provider: 'local-antigravity',
+    model: 'default',
+    sessionId: 'side:c1',
+    sideMainCount: 1,
+    messages: [mainMsg, q1, a1, q2],
+  }))
+  assert.match(r2.text, /readOk=true execOk=true/)
+  assert.match(r2.text, /Main context anchor line/, 'retains main snapshot after permission preset change')
+  assert.match(r2.text, /First side answer/, 'retains earlier side exchange after permission preset change')
+
+  // 2. Main workspace moves to nextCwd -> side session reopens in nextCwd with full snapshot!
+  currentCwd = nextCwd
+  const a2 = { id: 'side-a-2', role: 'assistant', content: [{ type: 'text', text: 'Second side answer' }] }
+  const q3 = user('side-q-3', 'side-inspect after-cwd-change')
+  const r3 = await collect(adapter.stream({
+    provider: 'local-antigravity',
+    model: 'default',
+    sessionId: 'side:c1',
+    sideMainCount: 1,
+    messages: [mainMsg, q1, a1, q2, a2, q3],
+  }))
+  assert.match(r3.text, new RegExp(`cwd=${nextCwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), 'reopens side session in new main workspace folder')
+  assert.match(r3.text, /Main context anchor line/, 'replays main snapshot in new workspace folder')
 })

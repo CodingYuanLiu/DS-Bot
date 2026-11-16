@@ -840,12 +840,27 @@ test('local-agent /side runs concurrently in an isolated read-only session witho
   assert.equal(eSub.activity, undefined)
   assert.equal(eSub.answer, 'Launching subagent inspector.\n\nSubagent report: all 3 checks green.')
 
-  // 4. Main chat progresses; ask follow-up Question 3 in the SAME Side Chat tab after background wakeup.
+  // 3b. Real `agy acp` background wakeup in /side (no stdout session/update after Turn 1,
+  //     delivered via Stop hook + transcriptPath / transcript_full.jsonl):
+  const transcriptDir = join(tmpRoot, 'side-transcript-logs')
+  const qTranscript = await callApi('side-ask', {
+    sessionId: 's-now',
+    chatId: q1.value.chatId,
+    text: `transcript-bg-wakeup:${transcriptDir}`,
+  })
+  assert.equal(qTranscript.ok, true, qTranscript.error?.message)
+  await rt.sideJoin(qTranscript.value.entryId)
+  const eTranscript = chatOf(rt, q1.value.chatId).entries[2]
+  assert.equal(eTranscript.status, 'done', eTranscript.error)
+  assert.equal(eTranscript.activity, undefined)
+  assert.equal(eTranscript.answer, 'Subagent dispatched in Turn 1.\n\nFull subagent report from transcript_full.jsonl!')
+
+  // 4. Main chat progresses; ask follow-up Question in the SAME Side Chat tab after background wakeup.
   session.messages.push({ id: 'm2', role: 'assistant', content: [{ type: 'text', text: 'Phase 1 throughput = 420 tok/s' }], source: { kind: 'model', provider: 'local-antigravity', model: 'default' } })
   const q2 = await callApi('side-ask', { sessionId: 's-now', chatId: q1.value.chatId, text: 'side-inspect follow-up check' })
   assert.equal(q2.ok, true, q2.error?.message)
   await rt.sideJoin(q2.value.entryId)
-  const e2 = chatOf(rt, q1.value.chatId).entries[2]
+  const e2 = chatOf(rt, q1.value.chatId).entries[3]
   assert.equal(e2.status, 'done', e2.error)
   assert.match(e2.answer, /open=2/, 'reuses the same side ACP session across follow-up questions')
   assert.match(e2.answer, /Phase 1 throughput = 420 tok\/s/, 'receives incremental main-chat updates')

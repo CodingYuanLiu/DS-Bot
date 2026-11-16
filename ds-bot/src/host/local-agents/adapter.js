@@ -6,6 +6,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { LlmAdapter, LlmError, offloadedImageText, resolveImageAttachmentAccess, textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import { textOf } from '../text.js'
+import { readAgyTranscriptWakeup, readAgyTranscriptWatermark } from './agy-steer.js'
 import { engineOf, cliMode } from './engines.js'
 import { LoopbackMcp } from './mcp.js'
 
@@ -20,6 +21,13 @@ const APPROVE_TOOL = 'approve_agent_action'
 
 const isBackgroundWake = message => message?.role === 'user' && message.source?.kind === 'bot' && message.source?.role === 'background'
 const isSideSession = sessionId => typeof sessionId === 'string' && sessionId.startsWith('side:')
+const isWakeEvent = event => event?.type === 'text' || event?.type === 'thought' || event?.type === 'activity' || event?.type === 'call' || event?.type === 'permission'
+const hasWakeEvents = events => events.some(isWakeEvent)
+const resetBgStdout = (live) => {
+  live.bgStdoutText = ''
+  live.bgStdoutThoughtChars = 0
+  live.bgStdoutActivities = 0
+}
 // A CLI that answers its compaction command first and condenses after (Devin) says
 // that it started within this long, or it is taken to have condensed without a word.
 const COMPACT_START_MS = 15_000
@@ -91,7 +99,7 @@ export class LocalAgentAdapter extends LlmAdapter {
       driver = this.deps.spawnEngine(spec.kind, route, spec, {
         drainSteer: cliSessionId => this.drainHookSteer(route, cliSessionId),
         hasPendingSteer: cliSessionId => this.hasHookSteer(route, cliSessionId),
-        onStopState: (cliSessionId, fullyIdle) => this.noteHookStopState(route, cliSessionId, fullyIdle),
+        onStopState: (cliSessionId, fullyIdle, transcriptPath, terminationReason) => this.noteHookStopState(route, cliSessionId, fullyIdle, transcriptPath, terminationReason),
       })
       this.engines.set(route, driver)
     }
@@ -132,9 +140,76 @@ export class LocalAgentAdapter extends LlmAdapter {
     return false
   }
 
-  noteHookStopState(route, cliSessionId, fullyIdle) {
+  async noteHookStopState(route, cliSessionId, fullyIdle, transcriptPath, terminationReason) {
     const live = this.liveByCliSession(route, cliSessionId)
-    if (live !== undefined) live.cliFullyIdle = fullyIdle !== false
+    if (live === undefined || live.dead) return
+    if (typeof fullyIdle === 'boolean') live.cliFullyIdle = fullyIdle
+    const cancelled = terminationReason === 'USER_CANCELED' || live.cancellingTurn === true
+    if (cancelled) {
+      if (fullyIdle !== false) live.cancellingTurn = false
+      resetBgStdout(live)
+      if (typeof transcriptPath === 'string' && transcriptPath.endsWith('.jsonl')) {
+        const mark = readAgyTranscriptWatermark(transcriptPath)
+        if (mark !== undefined) live.transcriptWatermark = mark
+      }
+      return
+    }
+    if (typeof transcriptPath !== 'string' || !transcriptPath.endsWith('.jsonl')) return
+    // While an ACP `session/prompt` RPC is open (`running === true`), `agy` streams
+    // `session/update` chunks on stdout: record the transcript watermark at turn end
+    // so any subsequent internal background wakeup reads only new steps.
+    if (live.engineSession?.running === true) {
+      const mark = readAgyTranscriptWatermark(transcriptPath)
+      if (mark !== undefined) live.transcriptWatermark = mark
+      return
+    }
+    let wakeup = readAgyTranscriptWakeup(transcriptPath, live.transcriptWatermark)
+    for (let attempt = 0; attempt < 3 && wakeup?.unresolvedTruncated; attempt += 1) {
+      await new Promise(resolve => { setTimeout(resolve, 25) })
+      if (live.dead || live.engineSession?.running === true || live.cancellingTurn === true) return
+      wakeup = readAgyTranscriptWakeup(transcriptPath, live.transcriptWatermark)
+    }
+    if (wakeup?.unresolvedTruncated && fullyIdle !== false) {
+      wakeup = readAgyTranscriptWakeup(transcriptPath, live.transcriptWatermark, { allowIncomplete: true })
+    }
+    if (wakeup === undefined) return
+    live.transcriptWatermark = wakeup.watermark
+    const seenText = live.bgStdoutText
+    const seenThoughts = live.bgStdoutThoughtChars
+    const seenActivities = live.bgStdoutActivities
+    resetBgStdout(live)
+    let pushedAny = false
+    if (seenText === '') {
+      for (const event of wakeup.events) {
+        if (event.type === 'thought' && seenThoughts > 0) continue
+        if (event.type === 'activity' && seenActivities > 0) continue
+        live.push(event)
+        pushedAny = true
+      }
+    } else {
+      for (const event of wakeup.events) {
+        if (event.type === 'thought' && seenThoughts === 0) {
+          live.push(event)
+          pushedAny = true
+        } else if (event.type === 'activity' && seenActivities === 0) {
+          live.push(event)
+          pushedAny = true
+        }
+      }
+      const fullTranscriptText = wakeup.events.filter(event => event.type === 'text').map(event => event.text).join('')
+      if (fullTranscriptText !== '') {
+        let missingText = ''
+        if (fullTranscriptText.startsWith(seenText)) missingText = fullTranscriptText.slice(seenText.length)
+        else if (!seenText.includes(fullTranscriptText)) missingText = `\n\n${fullTranscriptText}`
+        if (missingText !== '') {
+          live.push({ type: 'text', text: missingText })
+          pushedAny = true
+        }
+      }
+    }
+    if (pushedAny || live.background === true) {
+      live.push({ type: 'done', reason: 'end_turn' })
+    }
   }
 
   markSteerPending(sessionId) {
@@ -245,10 +320,9 @@ export class LocalAgentAdapter extends LlmAdapter {
 
   // ---------------------------------------------------------------------------
   // The live bridge for one DS Bot Session.
-  async liveFor(options, preset) {
+  async liveFor(options, preset, resolvedCwd) {
     const sessionId = String(options.sessionId)
     let live = this.live.get(sessionId)
-    const record = this.deps.record(sessionId)
     const route = options.provider
     if (live !== undefined && !live.dead && live.route === route) {
       // An agent CLI can exit between the spawn and its first message (a failed
@@ -262,11 +336,23 @@ export class LocalAgentAdapter extends LlmAdapter {
         // instead of reading its exit as the new turn's failure.
         live.events.length = 0
       }
-      // A CLI takes its model and permission mode when its session opens. Another
-      // model or preset reopens the same CLI session as soon as no turn runs in it.
-      if ((live.model === options.model && live.preset === preset) || live.state !== 'idle' || live.background) return live
-      await this.closeLive(live, { idle: true })
-    } else if (live !== undefined) await this.closeLive(live)
+      // If a Side Chat's owning main conversation moved to another working folder,
+      // close the stale side session so the next prompt opens in the new folder.
+      if (isSideSession(sessionId) && resolvedCwd !== undefined && live.cwd !== undefined && live.cwd !== resolvedCwd && live.state === 'idle' && !live.background) {
+        await this.closeSideSession(sessionId)
+        live = undefined
+      } else {
+        // A CLI takes its model and permission mode when its session opens. Another
+        // model or preset reopens the same CLI session as soon as no turn runs in it.
+        if ((live.model === options.model && live.preset === preset) || live.state !== 'idle' || live.background) return live
+        await this.closeLive(live, { idle: true })
+        live = undefined
+      }
+    } else if (live !== undefined) {
+      await this.closeLive(live)
+      live = undefined
+    }
+    const record = this.deps.record(sessionId)
     const spec = engineOf(route, this.deps.customAgents())
     if (spec === undefined) throw new LlmError(`Unknown local agent ${route}`, 'LOCAL_AGENT_MISSING')
     const engine = this.engine(route)
@@ -290,6 +376,11 @@ export class LocalAgentAdapter extends LlmAdapter {
       // turn waits on a bridged tool call or a permission answer.
       state: 'idle',
       background: false,
+      bgStdoutText: '',
+      bgStdoutThoughtChars: 0,
+      bgStdoutActivities: 0,
+      cancellingTurn: false,
+      transcriptWatermark: undefined,
       cliFullyIdle: true,
       // Prompts queued while a turn runs (ACP speaks one prompt at a time);
       // the drain sends the next one when the turn ends.
@@ -463,9 +554,13 @@ export class LocalAgentAdapter extends LlmAdapter {
 
   // The turn under way ends: the CLI stops, and a call it waits on gets an answer.
   stopTurn(live, reason) {
+    if (live.state !== 'idle' || live.engineSession?.running === true) {
+      live.cancellingTurn = true
+    }
     live.bgAbort?.abort()
     live.bgAbort = undefined
     live.background = false
+    resetBgStdout(live)
     live.cliFullyIdle = true
     live.state = 'idle'
     live.queue.length = 0
@@ -575,14 +670,16 @@ export class LocalAgentAdapter extends LlmAdapter {
     }
     const sessionId = options.sessionId
     if (sessionId === undefined) throw new LlmError('a local agent request needs a session', 'INVALID_REQUEST')
+    const sideSession = isSideSession(sessionId)
     const preset = this.deps.presetFor(sessionId)
-    const live = await this.liveFor(options, preset)
+    const sideCwd = sideSession ? await this.deps.cwdFor(sessionId) : undefined
+    const live = await this.liveFor(options, preset, sideCwd)
 
     // What the request carries past the last handed message. When the marker is
     // gone the CLI session is stale or new: it gets a replay instead of a delta.
     const messages = options.messages ?? []
     const at = live.handed === undefined ? -1 : messages.findIndex(message => message.id === live.handed)
-    const fresh = live.handed === undefined || at === -1
+    let fresh = live.handed === undefined || at === -1
     const delta = fresh ? [] : messages.slice(at + 1)
 
     // Results of the calls the last step emitted answer the suspended CLI calls.
@@ -629,17 +726,16 @@ export class LocalAgentAdapter extends LlmAdapter {
       }
     }
 
-    const sideSession = isSideSession(sessionId)
     const system = messages.filter(message => message.role === 'system').map(message => textOf(message.content)).join('\n').trim()
     const promptHash = system === '' ? undefined : createHash('sha256').update(system).digest('hex')
     const mcp = sideSession ? undefined : await this.ensureMcp(live, () => this.deps.toolsFor(options))
-    const cwd = live.cwd ?? await this.deps.cwdFor(sessionId)
+    const cwd = sideCwd ?? live.cwd ?? await this.deps.cwdFor(sessionId)
     live.cwd = cwd
 
     const mode = cliMode(live.spec.kind, preset)
     const instructions = system === '' ? undefined : system
 
-    const freshCli = live.cliSessionId === undefined
+    let freshCli = live.cliSessionId === undefined
     if (live.engineSession === undefined) {
       const openArgs = {
         cwd,
@@ -658,6 +754,14 @@ export class LocalAgentAdapter extends LlmAdapter {
       }
       live.engineSession = await live.engine.open(sessionId, openArgs)
         .catch(error => { throw toLlmError(error, live) })
+      if (openArgs.resumeId !== undefined && live.engineSession.resumed === false) {
+        live.handed = undefined
+        live.sideMainHandedId = undefined
+        live.sideMainCount = 0
+        live.promptHash = undefined
+        fresh = true
+        freshCli = true
+      }
       // A resumed CLI reports its id only with `system/init`: keep the saved one
       // in the meantime, or a resume that fails would erase it.
       const reportedId = live.engineSession.acpSessionId ?? live.engineSession.threadId ?? live.engineSession.cliSessionId
@@ -674,7 +778,14 @@ export class LocalAgentAdapter extends LlmAdapter {
       void (async () => {
         while (live.pumpToken === token && !live.dead) {
           const event = await session.next()
-          if (live.pumpToken === token && !live.dead) live.push(event)
+          if (live.pumpToken === token && !live.dead) {
+            if (session.running !== true) {
+              if (event?.type === 'text') live.bgStdoutText += event.text ?? ''
+              else if (event?.type === 'thought') live.bgStdoutThoughtChars += (event.text ?? '').length
+              else if (event?.type === 'activity') live.bgStdoutActivities += 1
+            }
+            live.push(event)
+          }
         }
       })()
       if (live.spec.kind !== 'acp' && instructions !== undefined) live.promptHash = promptHash
@@ -878,6 +989,7 @@ export class LocalAgentAdapter extends LlmAdapter {
         return recover()
       }
     }
+    this.discardTurnOutput(live)
     this.startTurn(live, blocks, signal, effort)
     return Promise.resolve()
   }
@@ -891,6 +1003,8 @@ export class LocalAgentAdapter extends LlmAdapter {
   startTurn(live, input, signal, effort) {
     const blocks = typeof input === 'string' ? [{ type: 'text', text: input }] : input
     live.state = 'running'
+    live.cancellingTurn = false
+    resetBgStdout(live)
     // The turn an engine names is the one this stream reads: a finished turn's late
     // events carry another id and are dropped instead of answering this one (#1513).
     live.turnTag = undefined
@@ -973,6 +1087,7 @@ export class LocalAgentAdapter extends LlmAdapter {
             textBuf = ''
             await Promise.resolve(this.deps.onBackgroundText?.(live.sessionId, out)).catch(() => {})
           }
+          if (hasWakeEvents(live.events)) continue
           live.background = false
           break
         } else if (event.type === 'text') {
@@ -989,7 +1104,8 @@ export class LocalAgentAdapter extends LlmAdapter {
     } finally {
       if (live.bgAbort === ac) live.bgAbort = undefined
       if (live.background && live.state === 'idle' && !ac.signal.aborted) {
-        live.background = false
+        if (hasWakeEvents(live.events)) this.wakeBackground(live)
+        else live.background = false
       }
     }
   }
@@ -1002,6 +1118,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     let thinkBuf = ''
     let thinkIndex = -1
     let hasText = false
+    let bgBatchBreak = false
     let lastTouchAt = 0
     const pendingStepTexts = []
     const bgIdleMs = this.deps.bgIdleSettleMs ?? BG_IDLE_SETTLE_MS
@@ -1068,14 +1185,16 @@ export class LocalAgentAdapter extends LlmAdapter {
       switch (event.type) {
         case 'text': {
           touchStream()
+          const textChunk = bgBatchBreak ? `\n\n${event.text}` : event.text
+          bgBatchBreak = false
           hasText = true
           if (textIndex === -1) {
             if (thinkIndex !== -1) { yield { type: 'block-end', index: thinkIndex, block: { type: 'reasoning', text: thinkBuf } }; thinkIndex = -1; thinkBuf = '' }
             yield { type: 'block-start', index: index++, blockType: 'text' }
             textIndex = index - 1
           }
-          textBuf += event.text
-          yield { type: 'text-delta', index: textIndex, text: event.text }
+          textBuf += textChunk
+          yield { type: 'text-delta', index: textIndex, text: textChunk }
           break
         }
         case 'thought':
@@ -1143,12 +1262,23 @@ export class LocalAgentAdapter extends LlmAdapter {
             break
           }
           live.continuation = undefined
+          if (live.background && live.queue.length === 0 && live.steerQueue.length === 0 && hasWakeEvents(live.events)) {
+            if (event.usage !== undefined) yield addUsage(event.usage)
+            bgBatchBreak = hasText
+            break
+          }
           yield* closeBlocks()
           if (event.usage !== undefined) yield addUsage(event.usage)
           const wasBackground = live.background
           live.background = false
+          resetBgStdout(live)
           live.state = 'idle'
-          if (wasBackground) void Promise.resolve(this.deps.onBackgroundSettled?.(live.sessionId)).catch(() => {})
+          if (live.queue.length === 0 && live.steerQueue.length === 0 && hasWakeEvents(live.events)) {
+            live.background = true
+            this.wakeBackground(live)
+          } else if (wasBackground) {
+            void Promise.resolve(this.deps.onBackgroundSettled?.(live.sessionId)).catch(() => {})
+          }
           if (live.steerQueue.length > 0) {
             const cliSessionId = live.engineSession?.acpSessionId ?? live.cliSessionId
             if (cliSessionId !== undefined) live.engine.setSteerPending?.(cliSessionId, false)

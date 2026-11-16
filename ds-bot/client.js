@@ -38404,6 +38404,8 @@ function SideEntry({ chatId, entry, actions }) {
 }
 function SideChatView({ subject, chat, roster, actions }) {
   const scroll = (0, import_react55.useRef)(null);
+  const stickToBottom = (0, import_react55.useRef)(true);
+  const lastScrollMeta = (0, import_react55.useRef)({ chatId: void 0, count: 0 });
   const [draft, setDraft] = (0, import_react55.useState)("");
   const [fail2, setFail] = (0, import_react55.useState)(null);
   const entries2 = Array.isArray(chat?.entries) ? chat.entries : [];
@@ -38411,10 +38413,20 @@ function SideChatView({ subject, chat, roster, actions }) {
   const last = entries2.at(-1);
   const localSide = Boolean(roster?.byId?.[subject]?.engine);
   (0, import_react55.useEffect)(() => {
+    const prev = lastScrollMeta.current;
+    const chatChanged = prev.chatId !== chat?.id;
+    const entryAdded = entries2.length > prev.count;
+    lastScrollMeta.current = { chatId: chat?.id, count: entries2.length };
+    if (chatChanged || entryAdded) stickToBottom.current = true;
     const node = scroll.current;
-    if (node) node.scrollTop = node.scrollHeight;
+    if (node && stickToBottom.current) node.scrollTop = node.scrollHeight;
   }, [chat?.id, entries2.length, last?.status, last?.answer, last?.activity]);
   if (!chat) return null;
+  const onScroll = (event) => {
+    const node = event?.currentTarget ?? scroll.current;
+    if (!node) return;
+    stickToBottom.current = node.scrollHeight - node.scrollTop - node.clientHeight <= 48;
+  };
   const ask = () => {
     const text = draft.trim();
     if (text === "" || busy || typeof actions?.askSide !== "function") return;
@@ -38431,7 +38443,7 @@ function SideChatView({ subject, chat, roster, actions }) {
     (0, import_react55.createElement)("p", { className: "bt-side-note" }, localSide ? t("Isolated side session — runs without interrupting the main chat") : t("Answered from progress so far; nothing was run")),
     (0, import_react55.createElement)(
       "div",
-      { className: "bt-side-scroll", ref: scroll },
+      { className: "bt-side-scroll", ref: scroll, onScroll },
       entries2.map((entry) => (0, import_react55.createElement)(SideEntry, { key: entry.id, chatId: chat.id, entry, actions }))
     ),
     (0, import_react55.createElement)(

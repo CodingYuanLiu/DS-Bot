@@ -22,8 +22,9 @@
 // `--cursor-modes` lists the modes cursor-agent 2026.11.05 does (agent, plan, ask)
 // and refuses any other, as it does.
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
+import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 
 const exitAfterTurn = process.argv.includes('--exit-after-turn')
@@ -195,7 +196,7 @@ async function runPrompt(session, prompt, requestId) {
     return
   }
   session.prompts = [...(session.prompts ?? []), text]
-  if (text.includes('count-sessions')) { finish(`sessions: ${sessions.size}; seen: ${session.prompts.length}`); return }
+  if (text.includes('count-sessions')) { finish(`sessions: ${sessions.size}`); return }
   if (text.includes('slow-main:')) {
     const [, readyPath, releasePath] = /slow-main:([^|]+)\|([^\s]+)/.exec(text) ?? []
     if (readyPath) writeFileSync(readyPath, sessionId, 'utf8')
@@ -394,6 +395,49 @@ async function runPrompt(session, prompt, requestId) {
     update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'gp-2', kind: 'execute', status: 'in_progress', rawInput: { command: 'npm test' } })
     update(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'gp-2', status: 'completed' })
     finish('Final result delivered.')
+    return
+  }
+  if (text.includes('transcript-bg-wakeup:')) {
+    const [, dir] = /transcript-bg-wakeup:([^\s]+)/.exec(text) ?? []
+    mkdirSync(dir, { recursive: true })
+    const transcriptPath = join(dir, 'transcript.jsonl')
+    const fullPath = join(dir, 'transcript_full.jsonl')
+    const turn1Lines = [
+      JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: text }),
+      JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'Subagent dispatched in Turn 1.' }),
+    ].join('\n') + '\n'
+    writeFileSync(transcriptPath, turn1Lines, 'utf8')
+    writeFileSync(fullPath, turn1Lines, 'utf8')
+    update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Subagent dispatched in Turn 1.' } })
+    await callSteerHook({ conversationId: sessionId, hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL', fullyIdle: false, transcriptPath })
+    reply(requestId, { stopReason: 'end_turn' })
+    setTimeout(async () => {
+      // Real `agy acp` emits NO `session/update` on stdout once `session/prompt` ended:
+      // it writes steps to transcript.jsonl / transcript_full.jsonl and fires `Stop`.
+      const wakeStep = JSON.stringify({ step_index: 2, type: 'GENERIC', source: 'SYSTEM', status: 'DONE', content: '<SYSTEM_MESSAGE>subagent done</SYSTEM_MESSAGE>' })
+      const compactReply = JSON.stringify({
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        source: 'MODEL',
+        status: 'DONE',
+        thinking: 'Synthesizing subagent findings',
+        tool_calls: [{ name: 'manage_subagents' }],
+        content: 'Truncated preview...',
+        truncated_fields: ['content'],
+      })
+      const fullReply = JSON.stringify({
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        source: 'MODEL',
+        status: 'DONE',
+        thinking: 'Synthesizing subagent findings',
+        tool_calls: [{ name: 'manage_subagents' }],
+        content: 'Full subagent report from transcript_full.jsonl!',
+      })
+      writeFileSync(transcriptPath, `${turn1Lines}${wakeStep}\n${compactReply}\n`, 'utf8')
+      writeFileSync(fullPath, `${turn1Lines}${wakeStep}\n${fullReply}\n`, 'utf8')
+      await callSteerHook({ conversationId: sessionId, hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL', fullyIdle: true, transcriptPath })
+    }, 35)
     return
   }
   if (text.includes('bg-wakeup')) {

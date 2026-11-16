@@ -234,6 +234,8 @@ export function install(rt) {
 
   /** @type {Map<string, (outcome: string) => void>} */
   const sideWakeWaiters = new Map()
+  /** @type {Map<string, string>} */
+  const sideActiveEntries = new Map()
 
   const applyProgress = (baseText, entry, chat, { text, activity }) => {
     if (entry.status !== 'answering') return
@@ -313,7 +315,15 @@ export function install(rt) {
   async function complete(botId, chat, entry, snapshot, signal) {
     const localSide = rt.isLocalAgentRoute?.(snapshot.header?.config?.provider ?? '') === true
     const sideSessionId = localSide ? `side:${chat.id}` : undefined
-    if (sideSessionId !== undefined) rt.registerLocalAgentSideSession?.(sideSessionId, snapshot.sessionId)
+    if (sideSessionId !== undefined) {
+      rt.registerLocalAgentSideSession?.(sideSessionId, snapshot.sessionId)
+      sideActiveEntries.set(sideSessionId, entry.id)
+    }
+    const clearActiveEntry = () => {
+      if (sideSessionId !== undefined && sideActiveEntries.get(sideSessionId) === entry.id) {
+        sideActiveEntries.delete(sideSessionId)
+      }
+    }
     const extra = pairsOf(chat, entry, snapshot.header?.config, localSide)
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -337,16 +347,19 @@ export function install(rt) {
         if (result.failed !== undefined) {
           // Cancel already left this entry, and the check above returned. A provider
           // that stops on its own still fails it, so it does not stay 'answering'.
+          clearActiveEntry()
           if (settle(botId, chat, entry, { status: 'failed', error: result.failed, answer: '' })) await persist(botId)
           return
         }
         if (result.cutOff) {
+          clearActiveEntry()
           const answer = result.text ?? ''
           if (settle(botId, chat, entry, { status: 'failed', error: ASIDE_LIMIT, answer, finish: 'max-tokens' })) await persist(botId)
           return
         }
         if (result.toolCalls) {
           if (attempt === 0) continue
+          clearActiveEntry()
           if (settle(botId, chat, entry, { status: 'failed', error: TOOL_ERROR, answer: '' })) await persist(botId)
           return
         }
@@ -355,12 +368,14 @@ export function install(rt) {
           const drained = await drainSideBackgrounds(botId, chat, entry, snapshot, extra, sideSessionId, finalText, signal)
           if (drained === null) return
           if (drained.failed !== undefined) {
+            clearActiveEntry()
             if (settle(botId, chat, entry, { status: 'failed', error: drained.failed, answer: '' })) await persist(botId)
             return
           }
           finalText = drained.text
         }
         if (finalText === '') {
+          clearActiveEntry()
           if (settle(botId, chat, entry, { status: 'failed', error: EMPTY_ERROR, answer: '' })) await persist(botId)
           return
         }
@@ -369,6 +384,7 @@ export function install(rt) {
       }
     } catch (error) {
       if (signal.aborted || entry.status !== 'answering' || !alive(botId, chat, entry)) return
+      clearActiveEntry()
       const message = error?.message ?? String(error)
       rt.warn('ds-bot: side for %s failed: %s', botId, message)
       if (settle(botId, chat, entry, { status: 'failed', error: message, answer: '' })) await persist(botId)
@@ -389,8 +405,11 @@ export function install(rt) {
       if (chat === undefined) continue
       if (abandoned(botId)) return false
       if (answering(chat)) return true
-      const entry = (chat.entries ?? []).findLast(item => item?.status === 'done')
-      if (entry === undefined) return false
+      const lastEntry = (chat.entries ?? []).at(-1)
+      const ownerEntryId = sideActiveEntries.get(id)
+      if (lastEntry === undefined || lastEntry.status !== 'done') return false
+      if (ownerEntryId !== undefined && lastEntry.id !== ownerEntryId) return false
+      const entry = lastEntry
       const sessionId = rt.chatOf(botId)
       if (sessionId === undefined) return false
       const baseAnswer = entry.answer ?? ''
@@ -526,6 +545,7 @@ export function install(rt) {
       delete entry.activity
       entry.finishedAt = Date.now()
       chat.updatedAt = entry.finishedAt
+      sideActiveEntries.delete(`side:${chatId}`)
       flights.get(entryId)?.controller.abort()
       rt.cancelLocalAgentSideTurn?.(`side:${chatId}`)
       await persist(botId)
@@ -541,6 +561,7 @@ export function install(rt) {
       const index = list.findIndex(item => item?.id === chatId)
       if (index === -1) continue
       const chat = list[index]
+      sideActiveEntries.delete(`side:${chatId}`)
       const ids = (chat.entries ?? []).filter(entry => entry?.status === 'answering').map(entry => entry.id)
       for (const id of ids) flights.get(id)?.controller.abort()
       await drain(ids)

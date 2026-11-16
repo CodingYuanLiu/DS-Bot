@@ -41,6 +41,8 @@ function SideEntry({ chatId, entry, actions }) {
 
 export function SideChatView({ subject, chat, roster, actions }) {
   const scroll = useRef(null)
+  const stickToBottom = useRef(true)
+  const lastScrollMeta = useRef({ chatId: undefined, count: 0 })
   const [draft, setDraft] = useState('')
   const [fail, setFail] = useState(null)
   const entries = Array.isArray(chat?.entries) ? chat.entries : []
@@ -48,10 +50,20 @@ export function SideChatView({ subject, chat, roster, actions }) {
   const last = entries.at(-1)
   const localSide = Boolean(roster?.byId?.[subject]?.engine)
   useEffect(() => {
+    const prev = lastScrollMeta.current
+    const chatChanged = prev.chatId !== chat?.id
+    const entryAdded = entries.length > prev.count
+    lastScrollMeta.current = { chatId: chat?.id, count: entries.length }
+    if (chatChanged || entryAdded) stickToBottom.current = true
     const node = scroll.current
-    if (node) node.scrollTop = node.scrollHeight
+    if (node && stickToBottom.current) node.scrollTop = node.scrollHeight
   }, [chat?.id, entries.length, last?.status, last?.answer, last?.activity])
   if (!chat) return null
+  const onScroll = (event) => {
+    const node = event?.currentTarget ?? scroll.current
+    if (!node) return
+    stickToBottom.current = (node.scrollHeight - node.scrollTop - node.clientHeight) <= 48
+  }
   const ask = () => {
     const text = draft.trim()
     if (text === '' || busy || typeof actions?.askSide !== 'function') return
@@ -67,7 +79,7 @@ export function SideChatView({ subject, chat, roster, actions }) {
     h('p', { className: 'bt-side-note' }, localSide
       ? t('Isolated side session — runs without interrupting the main chat')
       : t('Answered from progress so far; nothing was run')),
-    h('div', { className: 'bt-side-scroll', ref: scroll },
+    h('div', { className: 'bt-side-scroll', ref: scroll, onScroll },
       entries.map(entry => h(SideEntry, { key: entry.id, chatId: chat.id, entry, actions }))),
     h('div', { className: 'bt-side-form' },
       h('textarea', {
