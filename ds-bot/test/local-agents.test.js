@@ -2214,3 +2214,321 @@ test('side session reopens cleanly with full snapshot replay when main cwd or pe
   assert.match(r3.text, new RegExp(`cwd=${nextCwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), 'reopens side session in new main workspace folder')
   assert.match(r3.text, /Main context anchor line/, 'replays main snapshot in new workspace folder')
 })
+
+test('antigravity isolates danger-full-access workers with --dangerously-skip-permissions so background cross-dir reads never deadlock', async (t) => {
+  const sharedCwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsb-agy-perm-')))
+  const txDir = mkdtempSync(join(tmpdir(), 'dsb-agy-bg-tx-'))
+  const presets = { sFull: 'danger-full-access', sWrite: 'workspace-write', sRead: 'read-only' }
+  const records = {}
+  let wokeResolve
+  const wokePromise = new Promise(resolve => { wokeResolve = resolve })
+  const spawned = []
+  const adapter = new LocalAgentAdapter({
+    rt: { warn: () => {} },
+    customAgents: () => [],
+    findExecutable: path => path,
+    spawnEngine: (_kind, route, spec, hooks = {}) => {
+      const engine = new AcpEngine(route, { ...spec, command: process.execPath, args: [FIXTURES.acp, '--agy'] }, { findExecutable: path => path, agyHomeDir: false, ...hooks })
+      spawned.push(engine)
+      return engine
+    },
+    record: id => records[id],
+    saveRecord: (id, rec) => { records[id] = rec },
+    presetFor: id => presets[id] ?? 'workspace-write',
+    cwdFor: async () => sharedCwd,
+    probeCwd: () => sharedCwd,
+    toolsFor: () => [],
+    onBackgroundWake: async (sessionId) => {
+      wokeResolve(sessionId)
+      return true
+    },
+  })
+  t.after(async () => {
+    await adapter.dispose()
+    rmSync(sharedCwd, { recursive: true, force: true })
+    rmSync(txDir, { recursive: true, force: true })
+  })
+
+  // 1. Same cwd, different presets -> isolated worker pools (`skipPerms: true` ONLY for `danger-full-access`)
+  const fullState = await collect(adapter.stream(options('sFull', [user('m1', 'show-state')], { provider: 'local-antigravity' })))
+  const writeState = await collect(adapter.stream(options('sWrite', [user('m1', 'show-state')], { provider: 'local-antigravity' })))
+  const readState = await collect(adapter.stream(options('sRead', [user('m1', 'show-state')], { provider: 'local-antigravity' })))
+  assert.match(fullState.text, /skipPerms: true/, 'danger-full-access gets --dangerously-skip-permissions')
+  assert.match(writeState.text, /skipPerms: false/, 'workspace-write stays on standard worker without flag')
+  assert.match(readState.text, /skipPerms: false/, 'read-only shares standard worker without flag')
+  assert.equal(spawned[0].workers.size, 2, 'one full-access worker and one standard worker for the shared folder')
+
+  // 2. Ephemeral `ask()` (read-only steward call) never reuses the `--dangerously-skip-permissions` worker
+  await adapter.closeSession('sWrite')
+  await adapter.closeSession('sRead')
+  assert.equal(spawned[0].workers.size, 1, 'standard worker closed once non-full-access sessions left')
+  const steward = await adapter.ask('sFull', { system: 'Steward', prompt: 'show-state' })
+  assert.match(steward, /skipPerms: false/, 'ephemeral read-only ask() never reuses a full-access worker')
+
+  // 3. Background wakeup cross-workspace `read_file` completes immediately without waiting for a foreground `session/prompt`
+  const turn1 = await collect(adapter.stream(options('sFull', [user('m1', 'show-state'), user('m2', `bg-cross-dir-read:${txDir}`)], { provider: 'local-antigravity' })))
+  assert.equal(turn1.text, '[waiting for subagent]')
+  const wokeSession = await Promise.race([
+    wokePromise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('background cross-dir read deadlocked')), 2_000)),
+  ])
+  assert.equal(wokeSession, 'sFull')
+  const bgTrigger = { id: 'bg-x1', role: 'user', content: [{ type: 'text', text: '[Background update]' }], source: { kind: 'bot', form: 'relay', role: 'background' } }
+  const bgOut = await collect(adapter.stream(options('sFull', [user('m1', 'show-state'), user('m2', `bg-cross-dir-read:${txDir}`), bgTrigger], { provider: 'local-antigravity' })))
+  assert.equal(bgOut.text, 'Cross-workspace background synthesis delivered!')
+})
+
+test('AcpEngine auto-allows danger-full-access permissions across unknown subagent sessions, bare background MCP calls, and fail-closed option sets', async () => {
+  // 1. Dedicated fullAccess worker: unknown child sessionId never fails with -32603
+  const fullWorker = new AcpEngine('local-antigravity', { ...ENGINES['local-antigravity'], cwdPerProcess: false }, { findExecutable: () => undefined })
+  fullWorker.fullAccess = true
+
+  assert.deepEqual(
+    await fullWorker.onRequest('session/request_permission', {
+      sessionId: 'subagent-child-unknown',
+      toolCall: { toolCallId: 'c1', kind: 'read' },
+      options: [
+        { optionId: 'reject-1', name: 'Reject', kind: 'reject_once' },
+        { optionId: 'always-1', name: 'Allow always', kind: 'allow_always' },
+        { optionId: 'once-1', name: 'Allow once', kind: 'allow_once' },
+      ],
+    }),
+    { outcome: { outcome: 'selected', optionId: 'once-1' } },
+    'prefers allow_once over allow_always and reject options',
+  )
+
+  assert.deepEqual(
+    await fullWorker.onRequest('session/request_permission', {
+      sessionId: 'subagent-child-unknown',
+      toolCall: { toolCallId: 'c2', kind: 'read' },
+      options: [
+        { optionId: 'reject-1', name: 'Reject', kind: 'reject_once' },
+        { optionId: 'always-1', name: 'Allow always', kind: 'allow_always' },
+      ],
+    }),
+    { outcome: { outcome: 'selected', optionId: 'always-1' } },
+    'falls back to allow_always when allow_once is absent',
+  )
+
+  assert.deepEqual(
+    await fullWorker.onRequest('session/request_permission', {
+      sessionId: 'subagent-child-unknown',
+      toolCall: { toolCallId: 'c3', kind: 'other' },
+      options: [
+        { optionId: 'reject_once', name: 'Reject_once' },
+        { optionId: 'denyAll', name: 'Deny all', kind: 'other' },
+        { optionId: 'proceed_action', name: 'Proceed' },
+      ],
+    }),
+    { outcome: { outcome: 'selected', optionId: 'proceed_action' } },
+    'falls back to first non-reject option while filtering underscore/camelCase reject labels',
+  )
+
+  for (const emptyOrRejectOnly of [
+    [],
+    undefined,
+    [null, undefined, { optionId: '   ', name: 'Allow', kind: 'allow_once' }],
+    [{ optionId: 'skip_op', name: 'Skip this operation' }],
+    [{ optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }, { optionId: 'no_cancel', name: 'No, cancel' }],
+  ]) {
+    assert.deepEqual(
+      await fullWorker.onRequest('session/request_permission', {
+        sessionId: 'subagent-child-unknown',
+        toolCall: { toolCallId: 'c4', kind: 'execute' },
+        options: emptyOrRejectOnly,
+      }),
+      { outcome: { outcome: 'cancelled' } },
+      'fails closed with cancelled when no validated affirmative allow option exists',
+    )
+  }
+
+  assert.deepEqual(
+    await fullWorker.onRequest('session/request_permission', {
+      sessionId: 'subagent-child-unknown',
+      toolCall: { toolCallId: 'c5', kind: 'read' },
+      options: [
+        { optionId: 'always-1', name: 'Allow always', kind: 'allow_always' },
+        { optionId: 'session-1', name: 'Allow for session', kind: 'allow_session' },
+      ],
+    }),
+    { outcome: { outcome: 'selected', optionId: 'session-1' } },
+    'prefers session-scoped allow over allow_always when allow_once is absent',
+  )
+
+  // 2. Shared non-fullAccess engine: session.preset === 'danger-full-access' handles bare background MCP calls
+  //    without tool_call metadata, while NEVER auto-allowing unattributed unknown sessionIds (even after forget()).
+  const sharedEngine = new AcpEngine('local-cursor-cli', ENGINES['local-cursor-cli'], { findExecutable: () => undefined })
+  await assert.rejects(
+    () => sharedEngine.onRequest('session/request_permission', {
+      sessionId: 'orphan-subagent',
+      toolCall: { toolCallId: 'x0' },
+      options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+    }),
+    err => err?.code === -32603,
+    'empty non-fullAccess engine rejects unknown sessionId',
+  )
+
+  const restrictedSess = sharedEngine.sessionFor('s-restricted')
+  restrictedSess.acpSessionId = 'acp-main-restricted'
+  restrictedSess.preset = 'read-only'
+
+  const fullSess = sharedEngine.sessionFor('s-full')
+  fullSess.acpSessionId = 'acp-main-full'
+  fullSess.preset = 'danger-full-access'
+  const queued = []
+  fullSess.push = ev => queued.push(ev)
+
+  assert.deepEqual(
+    await sharedEngine.onRequest('session/request_permission', {
+      sessionId: 'acp-main-full',
+      toolCall: { toolCallId: 'silent-bg-remember' }, // no session.toolCalls entry and no mcp_dsbot_* name
+      options: [
+        { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+        { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+      ],
+    }),
+    { outcome: { outcome: 'selected', optionId: 'allow' } },
+    'auto-allows bare background MCP call on danger-full-access session without queuing permission card',
+  )
+  assert.equal(queued.length, 0)
+
+  assert.deepEqual(
+    await sharedEngine.onRequest('session/request_permission', {
+      sessionId: 'acp-main-full',
+      toolCall: { toolCallId: 'silent-bg-no-allow' },
+      options: [{ optionId: 'deny', name: 'Deny', kind: 'reject_once' }],
+    }),
+    { outcome: { outcome: 'cancelled' } },
+    'known danger-full-access session also fails closed when no allow option is offered',
+  )
+
+  sharedEngine.forget('s-restricted')
+  await assert.rejects(
+    () => sharedEngine.onRequest('session/request_permission', {
+      sessionId: 'acp-late-child-of-forgotten-restricted',
+      toolCall: { toolCallId: 'child-read' },
+      options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+    }),
+    err => err?.code === -32603,
+    'shared non-fullAccess process never auto-approves unknown sessionIds even after restricted session is forgotten',
+  )
+})
+
+test('end-to-end: side subagent unknown sessionId, silent background MCP wakeup, note()/listModels isolation, preset downgrade, and wire session/cancel', async (t) => {
+  const sharedCwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsb-e2e-perm-')))
+  const bgDir = mkdtempSync(join(tmpdir(), 'dsb-e2e-bg-'))
+  const cancelLog = join(bgDir, 'cancels.log')
+  const presets = { 'side:c-full': 'danger-full-access', sWrite: 'workspace-write', sBgFull: 'danger-full-access', sAgyFull: 'danger-full-access' }
+  const records = {}
+  const wakes = []
+  let wakeNotify
+  const waitNextWake = () => new Promise((resolve) => {
+    if (wakes.length > 0) resolve(wakes.shift())
+    else wakeNotify = resolve
+  })
+  const spawnedWorkerArgs = []
+  const adapter = new LocalAgentAdapter({
+    rt: { warn: () => {} },
+    customAgents: () => [{ id: 'hook-nofullargs', name: 'Hook ACP', command: 'x', args: [] }],
+    findExecutable: path => path,
+    spawnEngine: (_kind, route, spec, hooks = {}) => {
+      const effectiveSpec = route === 'local-acp-hook-nofullargs' ? { ...spec, hookSteer: true } : spec
+      const engine = new AcpEngine(route, { ...effectiveSpec, command: process.execPath, args: [FIXTURES.acp, '--agy', `--cancel-log=${cancelLog}`] }, { findExecutable: path => path, agyHomeDir: false, ...hooks })
+      const origSpawn = engine.spawnWorker.bind(engine)
+      engine.spawnWorker = (cwd, opts) => {
+        const w = origSpawn(cwd, opts)
+        spawnedWorkerArgs.push({ fullAccess: Boolean(w.fullAccess), args: [...(w.engine.args ?? [])] })
+        return w
+      }
+      return engine
+    },
+    record: id => records[id],
+    saveRecord: (id, rec) => { records[id] = rec },
+    presetFor: id => presets[id] ?? 'workspace-write',
+    cwdFor: async () => sharedCwd,
+    probeCwd: () => sharedCwd,
+    toolsFor: () => [{ name: 'message_bot', description: 'Message bot', parameters: { type: 'object', properties: { to: { type: 'string' }, message: { type: 'string' } } } }],
+    onBackgroundWake: async (sessionId) => {
+      if (wakeNotify !== undefined) {
+        const fn = wakeNotify
+        wakeNotify = undefined
+        fn(sessionId)
+      } else {
+        wakes.push(sessionId)
+      }
+      return true
+    },
+  })
+  t.after(async () => {
+    await adapter.dispose()
+    rmSync(sharedCwd, { recursive: true, force: true })
+    rmSync(bgDir, { recursive: true, force: true })
+  })
+
+  // 1. Side Chat subagent with unknown sessionId under danger-full-access succeeds; workspace-write rejects -32603
+  const sideOut = await collect(adapter.stream(options('side:c-full', [user('q1', 'subagent-perm-probe')], { provider: 'local-antigravity' })))
+  assert.match(sideOut.text, /subagentPerm=\{"outcome":"selected","optionId":"allow-once"\}/)
+  assert.match(sideOut.text, /fallback=\{"outcome":"cancelled"\}/)
+
+  const writeOut = await collect(adapter.stream(options('sWrite', [user('q1', 'subagent-perm-probe')], { provider: 'local-antigravity' })))
+  assert.match(writeOut.text, /subagentPerm=\{"code":-32603,"message":"unknown session"\}/)
+  await adapter.closeSession('sWrite')
+  const cancelsAfterIdleClose = existsSync(cancelLog) ? readFileSync(cancelLog, 'utf8').trim().split('\n').filter(Boolean) : []
+  assert.equal(cancelsAfterIdleClose.length, 0, 'closing a fully idle session sends zero session/cancel notifications')
+
+  // 2. Model discovery (`probeModels`) never reuses a privileged `fullAccess` worker when no standard worker is live
+  adapter.dropModelCache('local-antigravity')
+  const beforeProbeWorkers = spawnedWorkerArgs.length
+  await adapter.probeModels('local-antigravity')
+  assert.equal(spawnedWorkerArgs.length, beforeProbeWorkers + 1, 'probeModels spawned a dedicated non-privileged probe worker')
+  assert.equal(spawnedWorkerArgs.at(-1)?.fullAccess, false, 'probeModels never runs on a --dangerously-skip-permissions worker')
+
+  // 3. Maintenance `note()` on an open `local-antigravity` `danger-full-access` session runs WITHOUT `--dangerously-skip-permissions`
+  const agyTurn1 = await collect(adapter.stream(options('sAgyFull', [user('m1', 'show-state')], { provider: 'local-antigravity' })))
+  assert.match(agyTurn1.text, /skipPerms: true/)
+  const agyNoteState = await adapter.note('sAgyFull', 'show-state', AbortSignal.timeout(5_000))
+  assert.match(agyNoteState, /skipPerms: false/, 'note() detaches from privileged worker and runs without --dangerously-skip-permissions')
+  const agyNotePerm = await adapter.note('sAgyFull', 'ask-permission', AbortSignal.timeout(5_000))
+  assert.equal(agyNotePerm, 'denied', 'note() denies permission prompts on Antigravity danger-full-access sessions')
+  const agyAfterNote = await collect(adapter.stream(options('sAgyFull', [user('m1', 'show-state'), user('m2', 'show-state')], { provider: 'local-antigravity' })))
+  assert.match(agyAfterNote.text, /skipPerms: true/, 'next normal turn resumes on full-access worker')
+
+  // 4. Preset downgrade while background / cliFullyIdle===false is active closes the privileged worker (sending 1 session/cancel)
+  //    and enforces the downgraded `read-only` preset on the next prompt!
+  const downTurn1 = await collect(adapter.stream(options('sAgyFull', [user('m1', 'show-state'), user('m2', 'show-state'), user('m3', `bg-cross-dir-read:${join(bgDir, 'down')}`)], { provider: 'local-antigravity' })))
+  assert.equal(downTurn1.text, '[waiting for subagent]')
+  presets.sAgyFull = 'read-only'
+  const cancelsBeforeDowngrade = existsSync(cancelLog) ? readFileSync(cancelLog, 'utf8').trim().split('\n').filter(Boolean).length : 0
+  const downTurn2 = await collect(adapter.stream(options('sAgyFull', [
+    user('m1', 'show-state'),
+    user('m2', 'show-state'),
+    user('m3', `bg-cross-dir-read:${join(bgDir, 'down')}`),
+    user('m4', 'ask-permission'),
+  ], { provider: 'local-antigravity' })))
+  const cancelsAfterDowngrade = existsSync(cancelLog) ? readFileSync(cancelLog, 'utf8').trim().split('\n').filter(Boolean).length : 0
+  assert.equal(cancelsAfterDowngrade, cancelsBeforeDowngrade + 1, 'stopping a session with background work emits session/cancel')
+  assert.equal(downTurn2.text, 'denied', 'downgraded read-only session immediately denies change permissions on a non-privileged worker')
+
+  // 5. Non-fullAccessArgs engine (`this.fullAccess !== true`) with `session.preset === 'danger-full-access'`:
+  //    background wakeup calling MCP without stdout `tool_call` metadata auto-allows and bridges MCP cleanly!
+  const t1 = await collect(adapter.stream(options('sBgFull', [user('m1', `bg-silent-mcp-perm:${bgDir}`)], { provider: 'local-acp-hook-nofullargs' })))
+  assert.equal(t1.text, '[running background job]')
+
+  const woke1 = await Promise.race([
+    waitNextWake(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('silent background MCP call deadlocked')), 2_000)),
+  ])
+  assert.equal(woke1, 'sBgFull')
+
+  const bgMsg = { id: 'bg-m1', role: 'user', content: [{ type: 'text', text: '[Background update]' }], source: { kind: 'bot', form: 'relay', role: 'background' } }
+  const step1 = await collect(adapter.stream(options('sBgFull', [user('m1', `bg-silent-mcp-perm:${bgDir}`), bgMsg], { provider: 'local-acp-hook-nofullargs' })))
+  assert.equal(step1.finish?.kind, 'tool-calls')
+  assert.equal(step1.calls[0]?.name, 'message_bot')
+
+  const step2 = await collect(adapter.stream(options('sBgFull', [
+    user('m1', `bg-silent-mcp-perm:${bgDir}`),
+    bgMsg,
+    toolResult('tr-1', step1.calls[0].id, 'synced-ok'),
+  ], { provider: 'local-acp-hook-nofullargs' })))
+  assert.equal(step2.text, 'Silent background MCP outcome: synced-ok')
+})

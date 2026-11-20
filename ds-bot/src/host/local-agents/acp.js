@@ -101,14 +101,20 @@ export class AcpEngine {
     }
   }
 
-  activeWorker() {
-    return [...this.workers.values()].find(worker => worker.peer !== undefined)
+  activeWorker({ allowFullAccess = true } = {}) {
+    return [...this.workers.values()].find(worker => worker.peer !== undefined && (allowFullAccess || !worker.fullAccess))
   }
 
-  spawnWorker(cwd) {
-    return new AcpEngine(
+  spawnWorker(cwd, { fullAccess = false } = {}) {
+    const extraArgs = fullAccess && Array.isArray(this.engine.fullAccessArgs) ? this.engine.fullAccessArgs : []
+    const worker = new AcpEngine(
       this.route,
-      { ...this.engine, cwdPerProcess: false, ...(cwd ? { spawnCwd: cwd } : {}) },
+      {
+        ...this.engine,
+        cwdPerProcess: false,
+        args: [...(this.engine.args ?? []), ...extraArgs],
+        ...(cwd ? { spawnCwd: cwd } : {}),
+      },
       {
         findExecutable: this.findExecutable,
         defaultEfforts: new Map(this.defaultEfforts),
@@ -121,6 +127,8 @@ export class AcpEngine {
         steerServer: this.engine.hookSteer === true ? this.ensureSteerServer() : undefined,
       },
     )
+    worker.fullAccess = fullAccess
+    return worker
   }
 
   workerOf(session, dshSessionId = session?.dshSessionId) {
@@ -219,7 +227,7 @@ export class AcpEngine {
     // still waiting there: a reopened session needs a fresh one.
     if (session === undefined || session.dead) {
       const queue = new EventQueue()
-      session = { dshSessionId, acpSessionId: undefined, dead: false, replaying: false, lastReplayAt: 0, replayDone: undefined, modes: [], toolCalls: new Map(), push: event => queue.push(event), next: () => queue.next() }
+      session = { dshSessionId, acpSessionId: undefined, preset: undefined, maintaining: false, dead: false, replaying: false, lastReplayAt: 0, replayDone: undefined, modes: [], toolCalls: new Map(), push: event => queue.push(event), next: () => queue.next() }
       this.sessions.set(dshSessionId, session)
     }
     return session
@@ -288,18 +296,40 @@ export class AcpEngine {
     }
   }
 
+  canAutoAllowPermission(session) {
+    if (session !== undefined) {
+      return session.maintaining !== true && session.preset === 'danger-full-access'
+    }
+    if (this.fullAccess !== true) return false
+    const entries = [...this.sessions.values()]
+    if (entries.some(entry => entry.maintaining === true || entry.preset !== 'danger-full-access')) return false
+    return true
+  }
+
   // Agent → client requests: permission prompts bridge to the approval tool;
   // the rest are refused — we hold no editor or terminal of our own.
   onRequest(method, params) {
     if (method === 'session/request_permission') {
+      const options = (Array.isArray(params?.options) ? params.options : [])
+        .filter(option => option !== null && typeof option === 'object')
+        .map(option => ({ optionId: option.optionId, name: option.name, kind: option.kind }))
       const session = [...this.sessions.values()].find(entry => entry.acpSessionId === params?.sessionId)
+      // Subagents spawned inside an isolated `fullAccess` ACP worker carry their own
+      // `params.sessionId`, and idle background wakeups omit stdout `tool_call` metadata:
+      // auto-allow on dedicated `fullAccess` workers and known `danger-full-access`
+      // sessions, failing closed (`cancelled`) when no validated allow option is offered.
+      if (this.canAutoAllowPermission(session)) {
+        const optionId = autoAllowOption(options)
+        return Promise.resolve(optionId !== undefined
+          ? { outcome: { outcome: 'selected', optionId } }
+          : { outcome: { outcome: 'cancelled' } })
+      }
       if (session === undefined) return Promise.reject({ code: -32603, message: 'unknown session' })
-      const options = (params?.options ?? []).map(option => ({ optionId: option.optionId, name: option.name, kind: option.kind }))
       const call = callOf(session, params?.toolCall)
       // Cursor, Devin and Antigravity ask before MCP tool calls. A call to DS Bot's
       // own server is approved once here: toolsFor() already narrowed what the Bot
       // may call. Other tools, and an agent that offers no one-time allow, still ask.
-      const once = ownToolCall(call) ? options.find(option => option.kind === 'allow_once') : undefined
+      const once = ownToolCall(call) ? options.find(option => option.kind === 'allow_once' && typeof option.optionId === 'string' && option.optionId.trim() !== '') : undefined
       if (once !== undefined) return Promise.resolve({ outcome: { outcome: 'selected', optionId: once.optionId } })
       const action = describeCall(call)
       return new Promise((resolve) => {
@@ -321,13 +351,19 @@ export class AcpEngine {
   }
 
   async openInWorker(dshSessionId, openArgs) {
-    const existing = openArgs.ephemeral === true ? this.activeWorker() : undefined
-    const key = openArgs.cwd ? resolve(openArgs.cwd) : ''
+    const fullAccess = openArgs.ephemeral !== true
+      && openArgs.maintaining !== true
+      && openArgs.preset === 'danger-full-access'
+      && Array.isArray(this.engine.fullAccessArgs)
+      && this.engine.fullAccessArgs.length > 0
+    const existing = openArgs.ephemeral === true ? this.activeWorker({ allowFullAccess: false }) : undefined
+    const baseKey = openArgs.cwd ? resolve(openArgs.cwd) : ''
+    const key = fullAccess ? `${baseKey}\0full-access` : baseKey
     const reused = existing !== undefined
     let worker = existing ?? this.workers.get(key)
     const created = worker === undefined
     if (created) {
-      worker = this.spawnWorker(key)
+      worker = this.spawnWorker(baseKey, { fullAccess })
       if (openArgs.ephemeral === true) worker.ephemeral = true
       this.workers.set(key, worker)
     }
@@ -417,9 +453,11 @@ export class AcpEngine {
   // A new or resumed ACP session for one DS Bot Session.
   async open(dshSessionId, openArgs) {
     if (this.engine.cwdPerProcess) return this.openInWorker(dshSessionId, openArgs)
-    const { cwd, mcp, resumeId, preset, model } = openArgs
+    const { cwd, mcp, resumeId, preset, model, maintaining } = openArgs
     const peer = await this.ensure()
     const session = this.sessionFor(dshSessionId)
+    session.preset = preset
+    session.maintaining = maintaining === true
     const { reply, loaded } = resumeId !== undefined
       ? await this.loadSession(peer, { cwd, mcp, resumeId, session })
       : { reply: await this.newSession(peer, { cwd, mcp }), loaded: false }
@@ -638,7 +676,7 @@ export class AcpEngine {
   // Models (and per-model thinking levels) the agent advertises on a probe session.
   async listModels({ cwd, mcp }) {
     if (this.engine.cwdPerProcess) {
-      const live = this.activeWorker()
+      const live = this.activeWorker({ allowFullAccess: false })
       if (live !== undefined) {
         const target = live.engine.spawnCwd && existsSync(live.engine.spawnCwd) ? live.engine.spawnCwd : cwd
         const models = await live.listModels({ cwd: target, mcp })
@@ -742,6 +780,43 @@ const ownToolCall = (call) => {
     || name.startsWith(`${MCP_SERVER}:`)
     || name.startsWith(`${MCP_SERVER}/`)
     || (name === 'call_mcp_tool' && (input.ServerName === MCP_SERVER || args.ServerName === MCP_SERVER))
+}
+const REJECT_KIND = /^(reject|deny|cancel|refuse|block|abort|skip)/i
+const REJECT_TOKEN = /^(reject|rejected|deny|denied|cancel|cancelled|canceled|refuse|refused|block|blocked|abort|aborted|never|no|forbid|disallowed?|skip|defer|later)$/i
+const AFFIRMATIVE_TOKEN = /^(allow|allowed|approve|approved|accept|accepted|yes|proceed|confirm|confirmed|continue)$/i
+function splitOptionTokens(text) {
+  return String(text ?? '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+}
+function isRejectOption(option) {
+  const kind = String(option?.kind ?? '').trim()
+  if (/^allow/i.test(kind)) return false
+  if (kind !== '' && REJECT_KIND.test(kind)) return true
+  return splitOptionTokens(`${option?.optionId ?? ''} ${option?.name ?? ''}`).some(token => REJECT_TOKEN.test(token))
+}
+function isAffirmativeUntyped(option) {
+  const kind = String(option?.kind ?? '').trim()
+  if (kind !== '') return false
+  const tokens = splitOptionTokens(`${option?.optionId ?? ''} ${option?.name ?? ''}`)
+  return tokens.length > 0 && tokens.some(token => AFFIRMATIVE_TOKEN.test(token))
+}
+function autoAllowOption(options) {
+  const valid = (Array.isArray(options) ? options : []).filter(option =>
+    option !== null
+    && typeof option === 'object'
+    && typeof option.optionId === 'string'
+    && option.optionId.trim() !== ''
+    && !isRejectOption(option))
+  return (
+    valid.find(option => option.kind === 'allow_once')
+    ?? valid.find(option => option.kind === 'allow_session')
+    ?? valid.find(option => /^allow/i.test(String(option.kind ?? '')) && option.kind !== 'allow_always')
+    ?? valid.find(option => isAffirmativeUntyped(option) && !/\balways\b/i.test(`${option.optionId} ${option.name ?? ''}`))
+    ?? valid.find(option => option.kind === 'allow_always')
+    ?? valid.find(option => isAffirmativeUntyped(option))
+  )?.optionId
 }
 const configOptionsOf = (options, category) => options.find(option => (option.category ?? option.id) === category)
 const textOf = content => (Array.isArray(content) ? content : [content]).filter(block => block?.type === 'text').map(block => block.text).join('')

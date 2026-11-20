@@ -23,6 +23,7 @@ const CLIS = {
   'antigravity': {
     name: 'Antigravity', kind: 'acp', hookSteer: true, command: 'agy', args: ['acp'], version: ['--version'], signIn: 'agy acp --login',
     cwdPerProcess: true,
+    fullAccessArgs: ['--dangerously-skip-permissions'],
     modes: {
       'read-only': ['default'],
       'workspace-write': ['accept-edits'],

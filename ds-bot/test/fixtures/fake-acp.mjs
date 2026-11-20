@@ -21,7 +21,9 @@
 // lists no compact command, `--no-usage` reports no usage.
 // `--cursor-modes` lists the modes cursor-agent 2026.11.05 does (agent, plan, ask)
 // and refuses any other, as it does.
+// A fake ACP agent for tests: newline JSON-RPC over stdio.
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { join } from 'node:path'
@@ -30,6 +32,7 @@ import { createInterface } from 'node:readline'
 const exitAfterTurn = process.argv.includes('--exit-after-turn')
 const cursorModes = process.argv.includes('--cursor-modes')
 const agyModes = process.argv.includes('--agy-modes') || process.argv.includes('--agy')
+const skipPermissionsFlag = process.argv.includes('--dangerously-skip-permissions')
 const replayOnLoad = process.argv.includes('--replay-on-load')
 const thoughtLevels = process.argv.includes('--thought-levels')
 const legacyModels = process.argv.includes('--legacy-models')
@@ -50,6 +53,8 @@ const reportsUsage = !process.argv.includes('--no-usage')
 const WINDOW = 262_000
 const MODES = agyModes ? ['default', 'accept-edits', 'auto', 'plan'] : cursorModes ? ['agent', 'plan', 'ask'] : ['ask', 'accept-edits', 'bypass']
 let refusedModes = 0
+let cancelCount = 0
+const cancelLog = process.argv.find(arg => arg.startsWith('--cancel-log='))?.slice('--cancel-log='.length)
 const sessions = new Map()
 let nextId = 0
 if (stateFile) {
@@ -58,6 +63,7 @@ if (stateFile) {
     nextId = sessions.size
   } catch {}
 }
+const nextSessionId = () => `acp-${randomUUID()}`
 const saveSaved = () => {
   if (stateFile) writeFileSync(stateFile, JSON.stringify(Object.fromEntries(sessions)))
 }
@@ -173,10 +179,13 @@ async function runPrompt(session, prompt, requestId) {
   }
   const text = blocks.filter(block => block.type === 'text').map(block => block.text ?? '').join('\n')
   const sessionId = session.id
+  session.cancelled = false
+  session.interactionOpen = true
   if (Array.isArray(session.catchupReplay) && session.catchupReplay.length > 0) {
     for (const notice of session.catchupReplay.splice(0)) update(sessionId, notice)
   }
   const finish = (textOut) => {
+    session.interactionOpen = false
     update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: textOut } })
     if (!reportsUsage) { reply(requestId, { stopReason: 'end_turn' }); return }
     const grow = Number(text.match(/grow:(\d+)/)?.[1] ?? 0)
@@ -249,9 +258,120 @@ async function runPrompt(session, prompt, requestId) {
     }, 35)
     return
   }
+  if (text.includes('subagent-perm-probe')) {
+    const childSessionId = `acp-subagent-${randomUUID()}`
+    const permRes = await ask('session/request_permission', {
+      sessionId: childSessionId,
+      toolCall: { toolCallId: 'sub-xread', kind: 'read', title: 'Read /outside/repo/weights.py' },
+      options: [
+        { optionId: 'deny-read', name: 'Reject', kind: 'reject_once' },
+        { optionId: 'allow-always', name: 'Allow always', kind: 'allow_always' },
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+      ],
+    })
+    const rejectOnlyRes = await ask('session/request_permission', {
+      sessionId: childSessionId,
+      toolCall: { toolCallId: 'sub-reject-only', kind: 'execute', title: 'Blocked op' },
+      options: [
+        { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
+        { optionId: 'deny_all', name: 'Deny all' },
+      ],
+    })
+    finish(`subagentPerm=${JSON.stringify(permRes?.result?.outcome ?? permRes?.error)} fallback=${JSON.stringify(rejectOnlyRes?.result?.outcome ?? rejectOnlyRes?.error)}`)
+    return
+  }
+  if (text.includes('bg-silent-mcp-perm:')) {
+    const [, dir] = /bg-silent-mcp-perm:([^\s]+)/.exec(text) ?? []
+    mkdirSync(dir, { recursive: true })
+    const transcriptPath = join(dir, 'transcript.jsonl')
+    const turn1Lines = [
+      JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: text }),
+      JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: '[running background job]' }),
+    ].join('\n') + '\n'
+    writeFileSync(transcriptPath, turn1Lines, 'utf8')
+    update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '[running background job]' } })
+    await callSteerHook({ conversationId: sessionId, hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL', fullyIdle: false, transcriptPath })
+    reply(requestId, { stopReason: 'end_turn' })
+    setTimeout(async () => {
+      // Idle background wakeup calling MCP `remember`: no `session/update` (`tool_call`)
+      // is emitted on stdout before `session/request_permission`, so `session.toolCalls`
+      // has no server metadata for `ownToolCall(call)`.
+      const perm = await ask('session/request_permission', {
+        sessionId,
+        toolCall: { toolCallId: 'bg-silent-remember' },
+        options: [
+          { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+          { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+        ],
+      })
+      let mcpNote = 'perm-denied'
+      if (perm?.result?.outcome?.outcome === 'selected' && perm.result.outcome.optionId === 'allow' && session.mcp) {
+        const res = await mcpCall(session.mcp, 'message_bot', { to: 'Chief', message: 'remembered' })
+        mcpNote = (res.content ?? []).map(block => block.text).join('')
+      }
+      const wakeStep = JSON.stringify({ step_index: 2, type: 'GENERIC', source: 'SYSTEM', status: 'DONE', content: '<SYSTEM_MESSAGE>job done</SYSTEM_MESSAGE>' })
+      const finalReply = JSON.stringify({
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        source: 'MODEL',
+        status: 'DONE',
+        content: `Silent background MCP outcome: ${mcpNote}`,
+      })
+      writeFileSync(transcriptPath, `${turn1Lines}${wakeStep}\n${finalReply}\n`, 'utf8')
+      await callSteerHook({ conversationId: sessionId, hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL', fullyIdle: true, transcriptPath })
+    }, 30)
+    return
+  }
   if (/\bhang\b/.test(text)) return // session/cancel releases it below
-  if (text.includes('show-state')) { finish(`cwd: ${process.cwd()}; effort: ${session.thoughtLevel ?? 'default'}${legacyModels ? `; model: ${session.model ?? 'default'}` : ''}`); return }
+  if (text.includes('show-state')) { finish(`cwd: ${process.cwd()}; effort: ${session.thoughtLevel ?? 'default'}${legacyModels ? `; model: ${session.model ?? 'default'}` : ''}; skipPerms: ${skipPermissionsFlag}; cancels: ${cancelCount}`); return }
   if (text.includes('show-mode')) { finish(`mode: ${session.mode}; refused: ${refusedModes}`); return }
+  if (text.includes('bg-cross-dir-read:')) {
+    const [, dir] = /bg-cross-dir-read:([^\s]+)/.exec(text) ?? []
+    mkdirSync(dir, { recursive: true })
+    const transcriptPath = join(dir, 'transcript.jsonl')
+    const turn1Lines = [
+      JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: text }),
+      JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: '[waiting for subagent]' }),
+    ].join('\n') + '\n'
+    writeFileSync(transcriptPath, turn1Lines, 'utf8')
+    update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '[waiting for subagent]' } })
+    session.interactionOpen = true
+    await callSteerHook({ conversationId: sessionId, hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL', fullyIdle: false, transcriptPath })
+    reply(requestId, { stopReason: 'end_turn' })
+    session.interactionOpen = false
+    setTimeout(async () => {
+      if (session.cancelled) return
+      if (!skipPermissionsFlag) {
+        // Real `agy acp` withdraws client interaction when `session/prompt` ends:
+        // cross-workspace `read_file` without `--dangerously-skip-permissions` blocks
+        // inside `requestPermissionFromClient` until a new foreground `session/prompt` opens!
+        while (!session.interactionOpen) {
+          await new Promise(resolve => setTimeout(resolve, 15))
+        }
+        await ask('session/request_permission', {
+          sessionId,
+          toolCall: { toolCallId: 'bg-xread', kind: 'read', title: 'Read /outside/model_load_opt/file.py' },
+          options: [
+            { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+            { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
+          ],
+        })
+      }
+      const wakeStep = JSON.stringify({ step_index: 2, type: 'GENERIC', source: 'SYSTEM', status: 'DONE', content: '<SYSTEM_MESSAGE>subagent done</SYSTEM_MESSAGE>' })
+      const finalReply = JSON.stringify({
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        source: 'MODEL',
+        status: 'DONE',
+        thinking: 'Read cross-workspace file smoothly',
+        tool_calls: [{ name: 'read_file' }],
+        content: 'Cross-workspace background synthesis delivered!',
+      })
+      writeFileSync(transcriptPath, `${turn1Lines}${wakeStep}\n${finalReply}\n`, 'utf8')
+      await callSteerHook({ conversationId: sessionId, hookEventName: 'Stop', terminationReason: 'NO_TOOL_CALL', fullyIdle: true, transcriptPath })
+    }, 30)
+    return
+  }
   if (text.includes('late-permission')) {
     void ask('session/request_permission', {
       sessionId, toolCall: { toolCallId: 'late', kind: 'execute', title: 'Late action' },
@@ -514,7 +634,7 @@ process.stdin.on('data', (chunk) => {
           fail(id, 'Invalid params: McpServerStdio malformed'); break
         }
         const defaultThought = String(params.cwd ?? '').includes('low-ws') ? 'low' : 'medium'
-        const session = { id: `acp-${++nextId}`, mcp: undefined, mode: MODES[0], thoughtLevel: defaultThought, ...(legacyModels ? { model: 'legacy-std' } : {}) }
+        const session = { id: nextSessionId(), mcp: undefined, mode: MODES[0], thoughtLevel: defaultThought, ...(legacyModels ? { model: 'legacy-std' } : {}) }
         if (server !== undefined) {
           session.mcp = server.command !== undefined
             ? { command: server.command, args: server.args ?? [], env: server.env }
@@ -621,6 +741,9 @@ process.stdin.on('data', (chunk) => {
         reply(id, {})
         break
       case 'session/cancel':
+        cancelCount += 1
+        if (sessions.has(params.sessionId)) sessions.get(params.sessionId).cancelled = true
+        if (cancelLog) writeFileSync(cancelLog, `${params.sessionId}\n`, { flag: 'a' })
         update(params.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'cancelled' } })
         break
       default:
